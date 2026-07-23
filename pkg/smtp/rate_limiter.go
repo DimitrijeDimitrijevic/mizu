@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"log/slog"
@@ -35,19 +36,23 @@ const maxGossipCount = 1_000_000
 // RateLimiter implements a multi-dimensional sliding window rate limiter with memberlist gossip sync.
 // It tracks connection attempts across multiple configurable dimensions (e.g., IP, FROM, TO, combinations).
 type RateLimiter struct {
-	mu                 sync.RWMutex
-	enabled            bool
-	dimensions         []dimensionTracker           // Configured rate limit dimensions
-	windows            map[string]*connectionWindow // composite key -> connection window with local/peer counts
-	gossipEnabled      bool
-	gossipInterval     time.Duration
-	whitelistedDomains map[string]bool // Domains exempt from rate limits
-	whitelistedSenders map[string]bool // Email addresses exempt from rate limits
-	logger             *slog.Logger
-	cluster            RateLimiterCluster // Memberlist cluster for gossip
-	nodeID             string             // This node's name (attached to outgoing gossip)
-	ctx                context.Context
-	cancel             context.CancelFunc
+	mu             sync.RWMutex
+	enabled        bool
+	dimensions     []dimensionTracker           // Configured rate limit dimensions
+	windows        map[string]*connectionWindow // composite key -> connection window with local/peer counts
+	gossipEnabled  bool
+	gossipInterval time.Duration
+	// whitelist holds the current exemption set (IPs, domains, senders). It is
+	// swapped atomically by the reload loop so CheckRateLimit reads it lock-free.
+	whitelist               atomic.Pointer[whitelistSnapshot]
+	whitelistSource         *whitelistSource
+	whitelistReloadInterval time.Duration
+	whitelistFileFP         map[string]string // path -> last-seen fingerprint (reload loop only)
+	logger                  *slog.Logger
+	cluster                 RateLimiterCluster // Memberlist cluster for gossip
+	nodeID                  string             // This node's name (attached to outgoing gossip)
+	ctx                     context.Context
+	cancel                  context.CancelFunc
 }
 
 // dimensionTracker tracks a single rate limit dimension
@@ -114,29 +119,31 @@ func NewRateLimiter(rlConfig config.RateLimitConfig, cluster RateLimiterCluster,
 		}
 	}
 
-	// Build whitelist maps for fast lookup
-	whitelistedDomains := make(map[string]bool)
-	for _, domain := range rlConfig.WhitelistedDomains {
-		whitelistedDomains[strings.ToLower(domain)] = true
-	}
-
-	whitelistedSenders := make(map[string]bool)
-	for _, sender := range rlConfig.WhitelistedSenders {
-		whitelistedSenders[strings.ToLower(sender)] = true
+	reloadInterval := time.Duration(rlConfig.WhitelistReloadIntervalSeconds) * time.Second
+	if reloadInterval <= 0 {
+		reloadInterval = 10 * time.Second
 	}
 
 	rl := &RateLimiter{
-		enabled:            rlConfig.Enabled,
-		dimensions:         dimensions,
-		windows:            make(map[string]*connectionWindow),
-		gossipEnabled:      rlConfig.GossipEnabled,
-		gossipInterval:     time.Duration(rlConfig.GossipIntervalSeconds) * time.Second,
-		whitelistedDomains: whitelistedDomains,
-		whitelistedSenders: whitelistedSenders,
-		logger:             logger,
-		cluster:            cluster,
-		ctx:                ctx,
-		cancel:             cancel,
+		enabled:                 rlConfig.Enabled,
+		dimensions:              dimensions,
+		windows:                 make(map[string]*connectionWindow),
+		gossipEnabled:           rlConfig.GossipEnabled,
+		gossipInterval:          time.Duration(rlConfig.GossipIntervalSeconds) * time.Second,
+		whitelistSource:         newWhitelistSource(rlConfig, logger),
+		whitelistReloadInterval: reloadInterval,
+		whitelistFileFP:         make(map[string]string),
+		logger:                  logger,
+		cluster:                 cluster,
+		ctx:                     ctx,
+		cancel:                  cancel,
+	}
+
+	// Build the initial whitelist snapshot and prime file fingerprints so the
+	// reload loop only rebuilds on an actual change.
+	rl.whitelist.Store(rl.whitelistSource.build())
+	for _, path := range rl.whitelistSource.filePaths() {
+		rl.whitelistFileFP[path] = fileFingerprint(path)
 	}
 
 	// Register handler for rate limit gossip from peers
@@ -149,7 +156,46 @@ func NewRateLimiter(rlConfig config.RateLimitConfig, cluster RateLimiterCluster,
 	// Start cleanup loop
 	concurrency.SafeGo(logger, "rate-limiter-cleanup", rl.cleanupLoop)
 
+	// Watch whitelist files for changes and hot-reload them. Only started when
+	// at least one file is configured.
+	if len(rl.whitelistSource.filePaths()) > 0 {
+		concurrency.SafeGo(logger, "rate-limiter-whitelist-reload", rl.whitelistReloadLoop)
+	}
+
 	return rl
+}
+
+// whitelistReloadLoop periodically checks the configured whitelist files and
+// rebuilds the whitelist snapshot when any of them changes on disk.
+func (rl *RateLimiter) whitelistReloadLoop() {
+	ticker := time.NewTicker(rl.whitelistReloadInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-rl.ctx.Done():
+			return
+		case <-ticker.C:
+			if rl.whitelistFilesChanged() {
+				rl.whitelist.Store(rl.whitelistSource.build())
+				rl.logger.Info("reloaded rate-limit whitelist files")
+			}
+		}
+	}
+}
+
+// whitelistFilesChanged reports whether any watched file's fingerprint changed
+// since the last check, updating the stored fingerprints. Only the reload loop
+// goroutine touches whitelistFileFP, so no locking is needed.
+func (rl *RateLimiter) whitelistFilesChanged() bool {
+	changed := false
+	for _, path := range rl.whitelistSource.filePaths() {
+		if fp := fileFingerprint(path); rl.whitelistFileFP[path] != fp {
+			rl.whitelistFileFP[path] = fp
+			changed = true
+		}
+	}
+	return changed
 }
 
 // CheckRateLimit checks if a session has exceeded any configured rate limits
@@ -159,9 +205,14 @@ func (rl *RateLimiter) CheckRateLimit(sessionCtx SessionContext) error {
 		return nil // Rate limiting disabled
 	}
 
-	// Check if sender is whitelisted (by email or domain)
-	if rl.isWhitelisted(sessionCtx.From) {
-		return nil // Whitelisted sender, skip rate limiting
+	// Skip rate limiting entirely for whitelisted connections (by IP, or by
+	// sender email/domain). A match exempts all dimensions.
+	snapshot := rl.whitelist.Load()
+	if snapshot.matchesIP(extractIP(sessionCtx.RemoteAddr)) {
+		return nil // Whitelisted IP
+	}
+	if snapshot.matchesSender(sessionCtx.From) {
+		return nil // Whitelisted sender
 	}
 
 	now := time.Now()
@@ -224,28 +275,6 @@ func (rl *RateLimiter) CheckRateLimit(sessionCtx SessionContext) error {
 	}
 
 	return nil
-}
-
-// isWhitelisted checks if a sender email is whitelisted (by exact match or domain)
-func (rl *RateLimiter) isWhitelisted(from string) bool {
-	if from == "" {
-		return false
-	}
-
-	from = strings.ToLower(from)
-
-	// Check exact email match
-	if rl.whitelistedSenders[from] {
-		return true
-	}
-
-	// Check domain match
-	domain := extractDomain(from)
-	if domain != "" && rl.whitelistedDomains[domain] {
-		return true
-	}
-
-	return false
 }
 
 // buildCompositeKey builds a composite key from the specified dimension keys and session context

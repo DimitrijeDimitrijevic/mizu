@@ -303,12 +303,21 @@ func (s *ServerConfig) ApplyDefaults(defaults DefaultsConfig) {
 
 // RateLimitConfig holds rate limiting configuration
 type RateLimitConfig struct {
-	Enabled               bool                 `toml:"enabled"`                 // Enable rate limiting (default: true)
-	GossipEnabled         bool                 `toml:"gossip_enabled"`          // Share rate limit state across cluster via gossip (default: false)
-	GossipIntervalSeconds int                  `toml:"gossip_interval_seconds"` // How often to gossip rate limit data in seconds (default: 5)
-	WhitelistedDomains    []string             `toml:"whitelisted_domains"`     // Domains exempt from all rate limits (e.g., ["example.com", "trusted.org"])
-	WhitelistedSenders    []string             `toml:"whitelisted_senders"`     // Email addresses exempt from all rate limits (e.g., ["admin@example.com"])
-	Dimensions            []RateLimitDimension `toml:"dimensions"`              // Rate limit dimensions (e.g., IP, FROM, FROM_DOMAIN, etc.)
+	Enabled               bool `toml:"enabled"`                 // Enable rate limiting (default: true)
+	GossipEnabled         bool `toml:"gossip_enabled"`          // Share rate limit state across cluster via gossip (default: false)
+	GossipIntervalSeconds int  `toml:"gossip_interval_seconds"` // How often to gossip rate limit data in seconds (default: 5)
+	// Whitelist entries below are exempt from ALL rate limit dimensions. Each
+	// kind accepts an inline array and/or an external file (one entry per line,
+	// blank lines and '#' comments ignored); the effective set is the union of
+	// both. Files are re-read automatically when they change on disk.
+	WhitelistedIPs                 []string             `toml:"whitelisted_ips"`                   // IPs/CIDRs exempt from all rate limits (e.g., ["1.2.3.4", "10.0.0.0/8"])
+	WhitelistedDomains             []string             `toml:"whitelisted_domains"`               // Sender domains exempt from all rate limits (e.g., ["example.com", "trusted.org"])
+	WhitelistedSenders             []string             `toml:"whitelisted_senders"`               // Sender addresses exempt from all rate limits (e.g., ["admin@example.com"])
+	WhitelistedIPsFile             string               `toml:"whitelisted_ips_file"`              // Optional file of IPs/CIDRs, merged with whitelisted_ips and hot-reloaded
+	WhitelistedDomainsFile         string               `toml:"whitelisted_domains_file"`          // Optional file of sender domains, merged with whitelisted_domains and hot-reloaded
+	WhitelistedSendersFile         string               `toml:"whitelisted_senders_file"`          // Optional file of sender addresses, merged with whitelisted_senders and hot-reloaded
+	WhitelistReloadIntervalSeconds int                  `toml:"whitelist_reload_interval_seconds"` // How often to check whitelist files for changes, in seconds (default: 10)
+	Dimensions                     []RateLimitDimension `toml:"dimensions"`                        // Rate limit dimensions (e.g., IP, FROM, FROM_DOMAIN, etc.)
 }
 
 // RateLimitDimension defines a single rate limit dimension with configurable key combination

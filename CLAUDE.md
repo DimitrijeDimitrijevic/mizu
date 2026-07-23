@@ -294,10 +294,17 @@ telnet localhost 25
 - Multi-dimensional: Can combine keys (IP, FROM, FROM_DOMAIN, TO, TO_DOMAIN, AUTHENTICATED_USER)
 - Sliding window algorithm
 - Gossip-based cluster-wide enforcement (optional)
-- Whitelist support: Domains and senders can be exempted from all rate limits
-  - `whitelisted_domains`: Entire domains bypass rate limits (e.g., ["trusted.com"])
-  - `whitelisted_senders`: Specific email addresses bypass rate limits (e.g., ["admin@example.com"])
-  - Case-insensitive matching
+- Whitelist support: IPs, domains, and senders can be exempted from ALL rate limit dimensions
+  - `whitelisted_ips`: IPs/CIDRs bypass rate limits (e.g., ["1.2.3.4", "10.0.0.0/8"])
+  - `whitelisted_domains`: Entire sender domains bypass rate limits (e.g., ["trusted.com"])
+  - `whitelisted_senders`: Specific sender addresses bypass rate limits (e.g., ["admin@example.com"])
+  - Case-insensitive matching (domains/senders)
+  - **External files + hot reload**: each kind also accepts a file path — `whitelisted_ips_file`,
+    `whitelisted_domains_file`, `whitelisted_senders_file` (one entry per line; blank lines and
+    `#` comments ignored). File entries are unioned with the inline arrays and re-read
+    automatically when the file changes on disk (`whitelist_reload_interval_seconds`, default 10).
+    A missing/unreadable file logs a warning and is treated as empty until it appears.
+    Implementation: [pkg/smtp/rate_limit_whitelist.go](pkg/smtp/rate_limit_whitelist.go) (atomic snapshot swap, lock-free read path)
 - Configured via `smtp.rate_limit.dimensions` array
 
 ## Workflow Orchestration

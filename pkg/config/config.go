@@ -37,6 +37,34 @@ func isLocalhostURL(rawURL string) bool {
 	return false
 }
 
+// ParseIPList parses IP whitelist entries into networks. Each entry is either
+// an exact IP ("1.2.3.4", "2001:db8::1") or a CIDR ("10.0.0.0/8"); exact IPs
+// become single-address networks.
+func ParseIPList(entries []string) ([]*net.IPNet, error) {
+	nets := make([]*net.IPNet, 0, len(entries))
+	for _, entry := range entries {
+		if strings.Contains(entry, "/") {
+			_, ipNet, err := net.ParseCIDR(entry)
+			if err != nil {
+				return nil, fmt.Errorf("invalid CIDR %q", entry)
+			}
+			nets = append(nets, ipNet)
+			continue
+		}
+		ip := net.ParseIP(entry)
+		if ip == nil {
+			return nil, fmt.Errorf("invalid IP address %q", entry)
+		}
+		mask := net.CIDRMask(128, 128)
+		if ip4 := ip.To4(); ip4 != nil {
+			ip = ip4
+			mask = net.CIDRMask(32, 32)
+		}
+		nets = append(nets, &net.IPNet{IP: ip, Mask: mask})
+	}
+	return nets, nil
+}
+
 // Validate checks the configuration for required fields and placeholder values.
 func (c *Config) Validate() error {
 	// Check that at least one server is configured
@@ -362,6 +390,13 @@ func (s *ServerConfig) Validate() error {
 		if usable == 0 {
 			return errors.New("rate_limit.enabled=true but no dimension has a positive limit - rate limiting would enforce nothing (set at least one dimension with limit > 0, or disable rate limiting)")
 		}
+	}
+
+	// Validate inline rate-limit IP whitelist entries so typos fail fast at
+	// startup. File-sourced entries are validated leniently at load/reload time
+	// (bad lines are skipped and logged) so a running server survives a bad edit.
+	if _, err := ParseIPList(s.RateLimit.WhitelistedIPs); err != nil {
+		return fmt.Errorf("rate_limit.whitelisted_ips: %w", err)
 	}
 
 	// Validate recipient validation config (HTTPS scheme is enforced in
