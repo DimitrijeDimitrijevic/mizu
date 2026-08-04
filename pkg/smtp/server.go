@@ -594,6 +594,7 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		rateLimiter:        be.RateLimiter,
 		metrics:            be.Metrics,
 		ctx:                ctx,
+		baseLogger:         be.Logger,
 		Logger:             be.Logger.With("trace_id", traceID, "remote_addr", remoteAddr, "remote_host", ptrRecord),
 		cancel:             cancel,
 		sessionsWg:         be.ActiveSessionsWg,
@@ -716,6 +717,7 @@ type Session struct {
 	rateLimiter    *RateLimiter           // Multi-dimensional rate limiter
 	metrics        *metrics.Metrics       // Prometheus metrics for observability
 	ctx            context.Context        // Session context with deadline for timeout
+	baseLogger     *slog.Logger           // Logger without session attrs, to rebuild Logger when the trace ID rotates
 	Logger         *slog.Logger           // Structured logger for this session
 	cancel         context.CancelFunc     // Cancel function to clean up resources
 	sessionsWg     *sync.WaitGroup        // WaitGroup to track active sessions for graceful shutdown
@@ -2030,6 +2032,14 @@ func (s *Session) validateHeaders(rawEmail string) error {
 // Reset is called to reset the session after a message.
 func (s *Session) Reset() {
 	s.Logger.Debug("Session reset")
+	// A later message on the same connection is a different email — rotate the
+	// trace ID so one trace ID always means one message. This also keeps
+	// mailqueuer's (trace_id, recipient) ingest dedup from ever suppressing a
+	// second, distinct message to the same recipient on this connection.
+	s.traceID = generateTraceID()
+	if s.baseLogger != nil { // bare test sessions have no baseLogger
+		s.Logger = s.baseLogger.With("trace_id", s.traceID, "remote_addr", s.remoteAddr, "remote_host", s.ptr)
+	}
 	s.from = ""
 	s.to = make([]string, 0)
 	s.mailData.Reset()
