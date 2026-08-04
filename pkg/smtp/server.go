@@ -2036,10 +2036,16 @@ func (s *Session) Reset() {
 	// trace ID so one trace ID always means one message. This also keeps
 	// mailqueuer's (trace_id, recipient) ingest dedup from ever suppressing a
 	// second, distinct message to the same recipient on this connection.
+	previousTraceID := s.traceID
 	s.traceID = generateTraceID()
 	if s.baseLogger != nil { // bare test sessions have no baseLogger
 		s.Logger = s.baseLogger.With("trace_id", s.traceID, "remote_addr", s.remoteAddr, "remote_host", s.ptr)
 	}
+	// Reset also fires on RSET and repeated EHLO, so connection/auth-time log
+	// lines carry an earlier trace ID than the message eventually delivered on
+	// this session. This line chains the IDs so a grep for either finds the
+	// rotation and can follow the session history.
+	s.Logger.Info("Trace ID rotated", "previous_trace_id", previousTraceID)
 	s.from = ""
 	s.to = make([]string, 0)
 	s.mailData.Reset()
