@@ -570,17 +570,17 @@ func (c *CheckDestination) CheckHealth() ComponentStatus {
 // CheckTLSCertificate checks if TLS certificate is valid and not expiring soon.
 type CheckTLSCertificate struct {
 	ServerName    string // per-server identifier, keeps component names unique
-	Domain        string
-	Port          int
+	DialAddr      string // local listener address to connect to (host:port)
+	SNI           string // server name for SNI + cert verification (the cert hostname)
 	WarnThreshold time.Duration // Warn if cert expires within this duration
 }
 
 // NewCheckTLSCertificate creates a new TLS certificate health checker.
-func NewCheckTLSCertificate(serverName, domain string, port int, warnThreshold time.Duration) *CheckTLSCertificate {
+func NewCheckTLSCertificate(serverName, dialAddr, sni string, warnThreshold time.Duration) *CheckTLSCertificate {
 	return &CheckTLSCertificate{
 		ServerName:    serverName,
-		Domain:        domain,
-		Port:          port,
+		DialAddr:      dialAddr,
+		SNI:           sni,
 		WarnThreshold: warnThreshold,
 	}
 }
@@ -588,13 +588,13 @@ func NewCheckTLSCertificate(serverName, domain string, port int, warnThreshold t
 func (c *CheckTLSCertificate) Name() string { return "tls_certificate:" + c.ServerName }
 
 func (c *CheckTLSCertificate) CheckHealth() ComponentStatus {
-	addr := fmt.Sprintf("%s:%d", c.Domain, c.Port)
-	// Connect to the domain to get certificate. A bounded dialer timeout is
-	// essential: without it a filtered port or stalled handshake blocks the
-	// whole /health handler (which waits on every checker) until the OS
-	// connect timeout (~75s), causing clients to time out.
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", addr, &tls.Config{
-		ServerName: c.Domain,
+	// Probe this node's own listener (DialAddr) but send/verify the hostname
+	// via SNI so the correct cert is selected and fully validated. A bounded
+	// dialer timeout is essential: without it a filtered port or stalled
+	// handshake blocks the whole /health handler (which waits on every
+	// checker) until the OS connect timeout (~75s), causing clients to time out.
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", c.DialAddr, &tls.Config{
+		ServerName: c.SNI,
 	})
 	if err != nil {
 		return ComponentStatus{

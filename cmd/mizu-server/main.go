@@ -744,17 +744,26 @@ func startHealthServer(cfg *config.Config, logger *slog.Logger, statsManager *st
 				continue
 			}
 			if srv.Hostname != "" && srv.Hostname != "mail.yourdomain.com" && srv.UsesImplicitTLS() {
-				_, portStr, err := net.SplitHostPort(srv.ListenAddr)
+				host, portStr, err := net.SplitHostPort(srv.ListenAddr)
 				if err != nil {
 					logger.Warn("Could not parse listen address for health check",
 						"server", srv.Name,
 						"error", err)
 					continue
 				}
-				port, _ := net.LookupPort("tcp", portStr)
-				if port > 0 {
-					checkers = append(checkers, health.NewCheckTLSCertificate(srv.Name, srv.Hostname, port, 14*24*time.Hour))
+				if port, _ := net.LookupPort("tcp", portStr); port <= 0 {
+					continue
 				}
+				// Probe this node's own listener, not the public hostname: the
+				// hostname round-robins across the cluster and its public path
+				// may be firewalled from the node itself (or lack NAT hairpin).
+				// Wildcard binds are dialed via loopback; SNI still carries the
+				// hostname so the correct cert is selected and verified.
+				if host == "" || host == "0.0.0.0" || host == "::" {
+					host = "127.0.0.1"
+				}
+				dialAddr := net.JoinHostPort(host, portStr)
+				checkers = append(checkers, health.NewCheckTLSCertificate(srv.Name, dialAddr, srv.Hostname, 14*24*time.Hour))
 			}
 		}
 	}
