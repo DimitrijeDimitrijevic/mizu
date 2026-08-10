@@ -735,8 +735,14 @@ func startHealthServer(cfg *config.Config, logger *slog.Logger, statsManager *st
 	// Check TLS certificates only for servers with implicit TLS (e.g. port 465).
 	// STARTTLS ports (25, 587) cannot be checked with tls.Dial - they require
 	// a plaintext SMTP greeting followed by STARTTLS upgrade.
+	// PROXY-protocol listeners are skipped: they require a PROXY header before
+	// the TLS handshake, which a direct tls.Dial can't send, so they're only
+	// reachable via HAProxy and there is nothing meaningful to probe directly.
 	if !cfg.Local {
 		for _, srv := range cfg.Servers {
+			if srv.ProxyProtocol {
+				continue
+			}
 			if srv.Hostname != "" && srv.Hostname != "mail.yourdomain.com" && srv.UsesImplicitTLS() {
 				_, portStr, err := net.SplitHostPort(srv.ListenAddr)
 				if err != nil {
@@ -747,7 +753,7 @@ func startHealthServer(cfg *config.Config, logger *slog.Logger, statsManager *st
 				}
 				port, _ := net.LookupPort("tcp", portStr)
 				if port > 0 {
-					checkers = append(checkers, health.NewCheckTLSCertificate(srv.Hostname, port, 14*24*time.Hour))
+					checkers = append(checkers, health.NewCheckTLSCertificate(srv.Name, srv.Hostname, port, 14*24*time.Hour))
 				}
 			}
 		}
@@ -1390,20 +1396,8 @@ func runSMTPServerInstance(ctx context.Context, serverCfg *config.ServerConfig, 
 
 	// Wrap with PROXY protocol listener if enabled
 	if serverCfg.ProxyProtocol {
-		// Build trusted subnet list for policy enforcement
-		var trustedNets []*net.IPNet
-		for _, entry := range serverCfg.ProxyProtocolTrusted {
-			if _, cidr, err := net.ParseCIDR(entry); err == nil {
-				trustedNets = append(trustedNets, cidr)
-			} else if ip := net.ParseIP(entry); ip != nil {
-				// Convert single IP to /32 or /128
-				bits := 32
-				if ip.To4() == nil {
-					bits = 128
-				}
-				trustedNets = append(trustedNets, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
-			}
-		}
+		// Trusted subnet list for policy enforcement, parsed by config.Validate
+		trustedNets := serverCfg.ProxyTrustedNets()
 
 		listener = &proxyproto.Listener{
 			Listener: listener,

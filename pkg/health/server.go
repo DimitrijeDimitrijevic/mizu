@@ -356,13 +356,35 @@ func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// Collect results from all checkers and determine the overall status.
+	// Collect results, but never block forever: a checker that hangs (or
+	// panics, in which case SafeGo recovers and never sends a result) must not
+	// wedge the whole endpoint. Any checker that misses the deadline is
+	// surfaced as unhealthy so the problem is visible.
+	received := make(map[string]bool, len(s.checkers))
+	deadline := time.After(8 * time.Second)
+collect:
 	for i := 0; i < len(s.checkers); i++ {
-		res := <-resultsChan
-		componentStatus[res.Name] = res.Status
-		if res.Status.Status == "unhealthy" {
-			overallStatus = "unhealthy" // If any component is unhealthy, the overall status is unhealthy.
+		select {
+		case res := <-resultsChan:
+			received[res.Name] = true
+			componentStatus[res.Name] = res.Status
+			if res.Status.Status == "unhealthy" {
+				overallStatus = "unhealthy" // If any component is unhealthy, the overall status is unhealthy.
+			}
+		case <-deadline:
+			break collect
 		}
+	}
+	for _, checker := range s.checkers {
+		name := checker.Name()
+		if received[name] {
+			continue
+		}
+		componentStatus[name] = ComponentStatus{
+			Status:  "unhealthy",
+			Details: map[string]string{"error": "health check timed out"},
+		}
+		overallStatus = "unhealthy"
 	}
 
 	if overallStatus != "healthy" {
@@ -547,26 +569,31 @@ func (c *CheckDestination) CheckHealth() ComponentStatus {
 
 // CheckTLSCertificate checks if TLS certificate is valid and not expiring soon.
 type CheckTLSCertificate struct {
+	ServerName    string // per-server identifier, keeps component names unique
 	Domain        string
 	Port          int
 	WarnThreshold time.Duration // Warn if cert expires within this duration
 }
 
 // NewCheckTLSCertificate creates a new TLS certificate health checker.
-func NewCheckTLSCertificate(domain string, port int, warnThreshold time.Duration) *CheckTLSCertificate {
+func NewCheckTLSCertificate(serverName, domain string, port int, warnThreshold time.Duration) *CheckTLSCertificate {
 	return &CheckTLSCertificate{
+		ServerName:    serverName,
 		Domain:        domain,
 		Port:          port,
 		WarnThreshold: warnThreshold,
 	}
 }
 
-func (c *CheckTLSCertificate) Name() string { return "tls_certificate" }
+func (c *CheckTLSCertificate) Name() string { return "tls_certificate:" + c.ServerName }
 
 func (c *CheckTLSCertificate) CheckHealth() ComponentStatus {
 	addr := fmt.Sprintf("%s:%d", c.Domain, c.Port)
-	// Connect to the domain to get certificate
-	conn, err := tls.Dial("tcp", addr, &tls.Config{
+	// Connect to the domain to get certificate. A bounded dialer timeout is
+	// essential: without it a filtered port or stalled handshake blocks the
+	// whole /health handler (which waits on every checker) until the OS
+	// connect timeout (~75s), causing clients to time out.
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", addr, &tls.Config{
 		ServerName: c.Domain,
 	})
 	if err != nil {
