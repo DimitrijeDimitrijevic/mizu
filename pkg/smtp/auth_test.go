@@ -102,6 +102,31 @@ func TestHTTPAuthenticator_Authenticate(t *testing.T) {
 		}
 	})
 
+	// Test user denied submission (403 from deny_smtp). This must be a clean,
+	// definitive auth failure — like 404, not like a 5xx service error — so the
+	// backend "denied" state doesn't surface as a transient error.
+	t.Run("user denied", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+		}))
+		defer server.Close()
+
+		auth := NewHTTPAuthenticator(server.URL, "test-auth-token", logger, nil)
+
+		authenticated, err := auth.Authenticate("denied@example.com", "testpass")
+		if authenticated {
+			t.Error("expected authentication to fail for denied user")
+		}
+		if err == nil {
+			t.Fatal("expected error describing failure reason")
+		}
+		// A definitive deny reads as "no such user", not a service-unavailable
+		// (transient) error, so the client is rejected rather than told to retry.
+		if strings.Contains(err.Error(), "unavailable") {
+			t.Errorf("403 should be a definitive deny, got service error: %v", err)
+		}
+	})
+
 	// Test authentication service error
 	t.Run("service error", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

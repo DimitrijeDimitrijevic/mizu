@@ -171,7 +171,15 @@ Key packages:
 
   // Response (user not found)
   404 Not Found
+
+  // Response (user denied submission — e.g. rcptd deny_smtp list)
+  403 Forbidden
   ```
+- Auth-backend status semantics: **200** = verify the returned hashes locally;
+  **404** = user unknown (AUTH rejected); **403** = user denied submission,
+  treated as a definitive AUTH failure exactly like 404 (not a transient/backend
+  error, so the client is rejected rather than told to retry); any other status =
+  backend error
 - Password verification happens **locally** (never send passwords over network)
 - Supports multiple password hashes per user (tries all until one matches)
 - URL supports `$email` and `$ip` placeholders for interpolation

@@ -209,6 +209,16 @@ func (a *HTTPAuthenticator) fetchCredentials(username, remoteIP string) (*AuthRe
 			"status", status,
 			"response", string(body))
 		return authResp, nil
+	case http.StatusForbidden:
+		// 403 means the user is denied submission (deny_smtp). Like 404 this is a
+		// definitive auth failure rather than a backend error; authResp carries no
+		// hashes, so the caller rejects the AUTH. Logged distinctly so operators
+		// can tell a deny apart from an unknown user.
+		a.logger.Info("auth request: user denied submission",
+			"username", username,
+			"url", requestURL,
+			"status", status)
+		return authResp, nil
 	default:
 		a.logger.Warn("auth request failed",
 			"username", username,
@@ -253,6 +263,12 @@ func FetchAuthCredentials(ctx context.Context, client *http.Client, requestURL, 
 		}
 		return resp.StatusCode, &authResp, body, nil
 	case http.StatusNotFound:
+		return resp.StatusCode, &AuthResponse{}, body, nil
+	case http.StatusForbidden:
+		// The backend denied submission for this user (rcptd deny_smtp). This is
+		// a definitive auth failure, not a transport error: hand back an empty
+		// (no-hashes) response so the caller rejects the AUTH the same way it
+		// does for an unknown user, rather than raising a backend error.
 		return resp.StatusCode, &AuthResponse{}, body, nil
 	default:
 		return resp.StatusCode, nil, body, nil
