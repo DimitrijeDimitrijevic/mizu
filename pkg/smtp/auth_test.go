@@ -2,6 +2,7 @@ package smtp
 
 import (
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -331,6 +332,16 @@ func TestMatchEmailPattern(t *testing.T) {
 		{"  *@example.com  ", "  user@example.com  ", true, "whitespace handling"},
 		{"*@", "user@example.com", false, "invalid pattern - no domain"},
 		{"@example.com", "user@example.com", false, "invalid pattern - no local part"},
+
+		// Regex patterns (regex_sender_login pass-through from rcptd)
+		{`/^noise\+.*@aaaa.tech/`, "noise+tag@aaaa.tech", true, "regex matches plus tag"},
+		{`/^noise\+.*@aaaa.tech/`, "Noise+Tag@AAAA.Tech", true, "regex case insensitive"},
+		{`/^noise\+.*@aaaa.tech/`, "noise@aaaa.tech", false, "regex requires plus tag"},
+		{`/^noise\+.*@aaaa.tech/`, "other+tag@aaaa.tech", false, "regex different local part"},
+		{`/^noise\+.*@aaaa.tech/`, "evil@evil.com,noise+t@aaaa.tech", false, "regex anchored at start"},
+		{`/^.*@bbbb.io/`, "anyone@bbbb.io", true, "regex domain wide"},
+		{`/[invalid/`, "user@example.com", false, "invalid regex never matches"},
+		{`//`, "user@example.com", false, "empty regex treated as literal, no match"},
 	}
 
 	for _, tt := range tests {
@@ -341,6 +352,38 @@ func TestMatchEmailPattern(t *testing.T) {
 					tt.pattern, tt.email, result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestCheckAllowedFrom_RegexEntries(t *testing.T) {
+	a := &HTTPAuthenticator{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	allowed := []string{"noise@aaaa.tech", `/^noise\+.*@aaaa.tech/`}
+
+	if !a.checkAllowedFrom(allowed, "stryan@aaaa.tech", "noise@aaaa.tech") {
+		t.Error("exact entry should match")
+	}
+	if !a.checkAllowedFrom(allowed, "stryan@aaaa.tech", "noise+glassdoor@aaaa.tech") {
+		t.Error("regex entry should match plus-tagged address")
+	}
+	if a.checkAllowedFrom(allowed, "stryan@aaaa.tech", "other@aaaa.tech") {
+		t.Error("unrelated address must not match")
+	}
+
+	// A display name starting with "/" is not a regex; extractEmail must
+	// still strip it down to the bracketed address.
+	displayName := []string{"/dev/null alias <alias@aaaa.tech>"}
+	if !a.checkAllowedFrom(displayName, "stryan@aaaa.tech", "alias@aaaa.tech") {
+		t.Error("display-name entry starting with '/' should match its bracketed address")
+	}
+
+	// An uncompilable regex (PCRE-only construct) is skipped with a warning
+	// and must not block other entries from matching.
+	withBadRegex := []string{`/^(?!noreply).*@aaaa.tech/`, "noise@aaaa.tech"}
+	if a.checkAllowedFrom(withBadRegex, "stryan@aaaa.tech", "anyone@aaaa.tech") {
+		t.Error("uncompilable regex must not match")
+	}
+	if !a.checkAllowedFrom(withBadRegex, "stryan@aaaa.tech", "noise@aaaa.tech") {
+		t.Error("entries after an uncompilable regex should still match")
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"migadu/mizu/pkg/concurrency"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -347,10 +348,24 @@ func (a *HTTPAuthenticator) checkAllowedFrom(allowedFromAddresses []string, auth
 		return authUser == fromAddr
 	}
 
-	// Check if from address matches any allowed pattern (exact or wildcard)
+	// Check if from address matches any allowed pattern (exact, wildcard, or regex)
 	for _, allowed := range allowedFromAddresses {
-		allowedEmail := extractEmail(allowed)
-		if matchEmailPattern(allowedEmail, fromAddr) {
+		pattern := strings.TrimSpace(allowed)
+		if isRegexPattern(pattern) {
+			// rcptd compile-checks patterns before serving them, but Go's RE2
+			// rejects PCRE-only constructs (lookaheads, backreferences); log
+			// those instead of silently never matching.
+			if _, err := regexCache.get(pattern[1 : len(pattern)-1]); err != nil {
+				a.logger.Warn("Ignoring allowed_from regex that does not compile",
+					"pattern", pattern, "error", err)
+				continue
+			}
+		} else {
+			// extractEmail would mangle a regex (it strips "Name <email>"
+			// forms and lowercases); only apply it to address patterns.
+			pattern = extractEmail(pattern)
+		}
+		if matchEmailPattern(pattern, fromAddr) {
 			return true
 		}
 	}
@@ -359,10 +374,24 @@ func (a *HTTPAuthenticator) checkAllowedFrom(allowedFromAddresses []string, auth
 }
 
 // matchEmailPattern checks if an email matches a pattern (supports wildcards)
-// Pattern examples: "user@example.com" (exact), "*@example.com" (domain wildcard)
+// Pattern examples: "user@example.com" (exact), "*@example.com" (domain
+// wildcard), "/^user\+.*@example\.com/" (regex from rcptd's regex_sender_login
+// pass-through, matched with Postfix pcre substring semantics).
 func matchEmailPattern(pattern, email string) bool {
-	pattern = strings.ToLower(strings.TrimSpace(pattern))
+	pattern = strings.TrimSpace(pattern)
 	email = strings.ToLower(strings.TrimSpace(email))
+
+	// Regex pattern: "/.../" — a compile failure is no match (checkAllowedFrom
+	// logs uncompilable patterns before calling here).
+	if isRegexPattern(pattern) {
+		re, err := regexCache.get(pattern[1 : len(pattern)-1])
+		if err != nil {
+			return false
+		}
+		return re.MatchString(email)
+	}
+
+	pattern = strings.ToLower(pattern)
 
 	// Exact match
 	if pattern == email {
@@ -378,6 +407,45 @@ func matchEmailPattern(pattern, email string) bool {
 	}
 
 	return false
+}
+
+// isRegexPattern reports whether an allowed_from entry is a "/.../" regex
+// (rcptd's regex_sender_login pass-through) rather than an address pattern.
+// The trailing "/" check matters: an entry like "/dev/null <alias@example.com>"
+// starts with a slash but is a display-name address, not a regex.
+func isRegexPattern(pattern string) bool {
+	return len(pattern) > 2 && strings.HasPrefix(pattern, "/") && strings.HasSuffix(pattern, "/")
+}
+
+// regexCache caches compiled allowed_from regex patterns. Entries come from
+// the trusted rcptd backend and the set is small and stable, so the cache is
+// unbounded and never evicted.
+var regexCache = &compiledRegexCache{patterns: make(map[string]compiledRegex)}
+
+type compiledRegex struct {
+	re  *regexp.Regexp
+	err error
+}
+
+type compiledRegexCache struct {
+	mu       sync.RWMutex
+	patterns map[string]compiledRegex
+}
+
+func (c *compiledRegexCache) get(pattern string) (*regexp.Regexp, error) {
+	c.mu.RLock()
+	entry, ok := c.patterns[pattern]
+	c.mu.RUnlock()
+	if !ok {
+		// Case-insensitive: SMTP addresses are compared lowercased, and the
+		// patterns are written for lowercase addresses.
+		re, err := regexp.Compile("(?i)" + pattern)
+		entry = compiledRegex{re: re, err: err}
+		c.mu.Lock()
+		c.patterns[pattern] = entry
+		c.mu.Unlock()
+	}
+	return entry.re, entry.err
 }
 
 // extractEmail extracts the email address from "Name <email>" or just "email" format

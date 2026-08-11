@@ -450,30 +450,35 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		case rdnsMissing:
 			hasRDNS = false
 
-			// Reject if rDNS is required
+			// Reject if rDNS is required, unless the IP is whitelisted
+			rdnsAllowReason := "not_required"
 			if be.ServerConfig.DNSChecks.RequireRDNS {
-				if be.StatsManager != nil {
-					// Reject returns early; record inline so this connection
-					// still counts toward the IP's connection total.
-					be.StatsManager.RecordConnection(ipStr, false)
-					be.StatsManager.RecordDeniedConnection(ipStr)
-				}
-				if be.Metrics != nil {
-					be.Metrics.SMTPMessagesRejected.WithLabelValues(be.ServerConfig.Name, be.ServerConfig.Type, "no_rdns").Inc()
-				}
+				if !ipInNets(ip, be.ServerConfig.DNSChecks.RDNSWhitelistNets()) {
+					if be.StatsManager != nil {
+						// Reject returns early; record inline so this connection
+						// still counts toward the IP's connection total.
+						be.StatsManager.RecordConnection(ipStr, false)
+						be.StatsManager.RecordDeniedConnection(ipStr)
+					}
+					if be.Metrics != nil {
+						be.Metrics.SMTPMessagesRejected.WithLabelValues(be.ServerConfig.Name, be.ServerConfig.Type, "no_rdns").Inc()
+					}
 
-				be.Logger.Info("Rejecting connection - no reverse DNS",
-					"server", be.ServerConfig.Name,
-					"remote_addr", remoteAddr)
-				return nil, &smtp.SMTPError{
-					Code:         450,
-					EnhancedCode: smtp.EnhancedCode{4, 7, 25},
-					Message:      fmt.Sprintf("no reverse DNS record for IP address %s", ipStr),
+					be.Logger.Info("Rejecting connection - no reverse DNS",
+						"server", be.ServerConfig.Name,
+						"remote_addr", remoteAddr)
+					return nil, &smtp.SMTPError{
+						Code:         450,
+						EnhancedCode: smtp.EnhancedCode{4, 7, 25},
+						Message:      fmt.Sprintf("no reverse DNS record for IP address %s", ipStr),
+					}
 				}
+				rdnsAllowReason = "ip_whitelisted"
 			}
-			be.Logger.Info("Connection allowed without reverse DNS (not required)",
+			be.Logger.Info("Connection allowed without reverse DNS",
 				"server", be.ServerConfig.Name,
-				"remote_addr", remoteAddr)
+				"remote_addr", remoteAddr,
+				"reason", rdnsAllowReason)
 
 		case rdnsSuccess:
 			ptrRecord = names[0]
@@ -498,15 +503,11 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 				isWhitelisted := false
 
 				// Check IP whitelist
-				for _, whitelistEntry := range be.ServerConfig.Reputation.WhitelistIPs {
-					if be.matchIPWhitelist(ipStr, whitelistEntry) {
-						be.Logger.Info("IP is whitelisted - skipping reputation check",
-							"server", be.ServerConfig.Name,
-							"remote_addr", remoteAddr,
-							"whitelist_entry", whitelistEntry)
-						isWhitelisted = true
-						break
-					}
+				if ipInNets(ip, be.ServerConfig.Reputation.WhitelistNets()) {
+					be.Logger.Info("IP is whitelisted - skipping reputation check",
+						"server", be.ServerConfig.Name,
+						"remote_addr", remoteAddr)
+					isWhitelisted = true
 				}
 
 				// Check hostname whitelist (PTR suffix match)
@@ -621,31 +622,14 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	return session, nil
 }
 
-// matchIPWhitelist checks if an IP matches a whitelist entry (supports CIDR)
-func (be *Backend) matchIPWhitelist(ip string, whitelistEntry string) bool {
-	// Parse the IP
-	ipAddr := net.ParseIP(ip)
-	if ipAddr == nil {
-		return false
-	}
-
-	// Check if whitelist entry is a CIDR
-	if strings.Contains(whitelistEntry, "/") {
-		_, ipNet, err := net.ParseCIDR(whitelistEntry)
-		if err != nil {
-			be.Logger.Warn("Invalid CIDR in whitelist", "entry", whitelistEntry, "error", err)
-			return false
+// ipInNets reports whether ip falls within any of the given networks
+func ipInNets(ip net.IP, nets []*net.IPNet) bool {
+	for _, n := range nets {
+		if n.Contains(ip) {
+			return true
 		}
-		return ipNet.Contains(ipAddr)
 	}
-
-	// Exact IP match
-	whitelistIP := net.ParseIP(whitelistEntry)
-	if whitelistIP == nil {
-		be.Logger.Warn("Invalid IP in whitelist", "entry", whitelistEntry)
-		return false
-	}
-	return ipAddr.Equal(whitelistIP)
+	return false
 }
 
 // rdnsResult classifies the outcome of a reverse-DNS (PTR) lookup. The three

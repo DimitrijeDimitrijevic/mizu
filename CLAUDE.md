@@ -166,7 +166,7 @@ Key packages:
   // Response (user found)
   {
     "password_hashes": ["$2a$10$...", "$2a$10$..."],  // Array of password hashes (bcrypt, SSHA512, SHA512)
-    "allowed_from": ["user@example.com", "alias@example.com"]
+    "allowed_from": ["user@example.com", "alias@example.com", "*@team.example.com", "/^user\\+.*@example.com/"]
   }
 
   // Response (user not found)
@@ -180,6 +180,9 @@ Key packages:
   treated as a definitive AUTH failure exactly like 404 (not a transient/backend
   error, so the client is rejected rather than told to retry); any other status =
   backend error
+- `allowed_from` entries may be exact addresses, `*@domain` wildcards, or
+  `/regex/` patterns (rcptd's regex_sender_login pass-through, matched
+  case-insensitively against MAIL FROM with substring semantics like Postfix pcre)
 - Password verification happens **locally** (never send passwords over network)
 - Supports multiple password hashes per user (tries all until one matches)
 - URL supports `$email` and `$ip` placeholders for interpolation
@@ -202,6 +205,16 @@ Key packages:
 - For 450 status code, response body can include JSON `{"message": "custom text", "temporary": true}` to provide custom message for temporary failure
 - Successful validations cached for 5 minutes (configurable)
 - Provides early rejection before DATA phase, reducing bandwidth and processing
+
+**DNS Checks Configuration:**
+- `[server.dns_checks]` section controls connection-time DNS validation
+- `require_rdns`: Reject connections whose IP has no PTR (reverse DNS) record
+- `rdns_whitelist_ips`: IPs/CIDRs exempt from `require_rdns` (e.g., `["1.2.3.4", "10.0.0.0/8"]` for monitoring probes or internal hosts)
+  - Exempts only the rDNS requirement — reputation checks still apply (use `reputation.whitelist_ips` to bypass those)
+  - Entries are validated at startup; invalid IPs/CIDRs fail config validation
+  - Sessions admitted without a PTR record interpolate `$ptr` as an empty string in sender/recipient validation URLs
+- `require_sender_mx`: Require sender domain to have MX records
+- `require_resolvable_helo`: Require HELO hostname to have DNS records
 
 ### Storage Backend Configuration
 

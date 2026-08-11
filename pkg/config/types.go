@@ -36,10 +36,11 @@ type ServerConfig struct {
 	Type string `toml:"type"` // "relay" (MX server) or "submission" (MSA server)
 
 	// === Network ===
-	ListenAddr           string   `toml:"listen_addr"`            // Address to bind (e.g., ":25", ":465", ":587", "127.0.0.1:2525")
-	Hostname             string   `toml:"hostname"`               // Server hostname/FQDN (overrides defaults.hostname if set)
-	ProxyProtocol        bool     `toml:"proxy_protocol"`         // Enable HAProxy PROXY protocol v1/v2 (real client IP from PROXY header)
-	ProxyProtocolTrusted []string `toml:"proxy_protocol_trusted"` // CIDRs/IPs allowed to send PROXY headers (required when proxy_protocol=true)
+	ListenAddr           string       `toml:"listen_addr"`            // Address to bind (e.g., ":25", ":465", ":587", "127.0.0.1:2525")
+	Hostname             string       `toml:"hostname"`               // Server hostname/FQDN (overrides defaults.hostname if set)
+	ProxyProtocol        bool         `toml:"proxy_protocol"`         // Enable HAProxy PROXY protocol v1/v2 (real client IP from PROXY header)
+	ProxyProtocolTrusted []string     `toml:"proxy_protocol_trusted"` // CIDRs/IPs allowed to send PROXY headers (required when proxy_protocol=true)
+	proxyTrustedNets     []*net.IPNet // ProxyProtocolTrusted parsed by Validate
 
 	// === Message Processing ===
 	MaxMessageSize          int `toml:"max_message_size"`           // Maximum message size in bytes (overrides default)
@@ -116,6 +117,13 @@ type ServerReputationConfig struct {
 	WhitelistIPs   []string                    `toml:"whitelist_ips"`    // IP addresses/CIDRs to whitelist (e.g., ["1.2.3.4", "10.0.0.0/8"])
 	WhitelistHosts []string                    `toml:"whitelist_hosts"`  // PTR hostnames to whitelist (suffix match, e.g., ["hetrixtools.com", "pingdom.com"])
 	DNSBL          ServerReputationDNSBLConfig `toml:"dnsbl"`            // DNS blacklist checking that feeds into reputation scoring
+	whitelistNets  []*net.IPNet                // WhitelistIPs parsed by ServerConfig.Validate
+}
+
+// WhitelistNets returns the parsed whitelist_ips networks. Populated by
+// ServerConfig.Validate.
+func (c *ServerReputationConfig) WhitelistNets() []*net.IPNet {
+	return c.whitelistNets
 }
 
 // ServerReputationDNSBLConfig holds DNSBL checking configuration for reputation
@@ -209,6 +217,20 @@ type ServerDNSChecksConfig struct {
 	RequireRDNS           bool `toml:"require_rdns"`            // Require reverse DNS for sender IP
 	RequireSenderMX       bool `toml:"require_sender_mx"`       // Require sender domain to have MX records
 	RequireResolvableHELO bool `toml:"require_resolvable_helo"` // Require HELO hostname to have DNS records (default: false)
+
+	// RDNSWhitelistIPs lists IP addresses/CIDRs exempt from require_rdns
+	// (e.g., ["1.2.3.4", "10.0.0.0/8"]). The exemption covers only the rDNS
+	// requirement; reputation checks still apply (use reputation.whitelist_ips
+	// to bypass those). Sessions admitted without a PTR record interpolate
+	// $ptr as an empty string in sender/recipient validation URLs.
+	RDNSWhitelistIPs  []string     `toml:"rdns_whitelist_ips"`
+	rdnsWhitelistNets []*net.IPNet // RDNSWhitelistIPs parsed by ServerConfig.Validate
+}
+
+// RDNSWhitelistNets returns the parsed rdns_whitelist_ips networks. Populated
+// by ServerConfig.Validate.
+func (c *ServerDNSChecksConfig) RDNSWhitelistNets() []*net.IPNet {
+	return c.rdnsWhitelistNets
 }
 
 // ServerJunkConfig holds junk/spam detection configuration
@@ -239,6 +261,12 @@ type ServerTLSConfig struct {
 	Required      bool   `toml:"required"`        // Enforce TLS (reject unencrypted connections)
 	MinTLSVersion string `toml:"min_tls_version"` // Minimum TLS version: "1.2" or "1.3"
 	MaxTLSVersion string `toml:"max_tls_version"` // Maximum TLS version: "1.2" or "1.3" (empty = no cap). Set to "1.2" for Exchange Online interop.
+}
+
+// ProxyTrustedNets returns the parsed proxy_protocol_trusted networks.
+// Populated by ServerConfig.Validate.
+func (s *ServerConfig) ProxyTrustedNets() []*net.IPNet {
+	return s.proxyTrustedNets
 }
 
 // IsRelay returns true if this is a relay (MX) server

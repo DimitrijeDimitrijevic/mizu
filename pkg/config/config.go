@@ -318,6 +318,17 @@ func (s *ServerConfig) Validate() error {
 		}
 	}
 
+	// Parse IP whitelists once; the server backend reads the parsed networks
+	// via the accessors, so a typo in any list fails startup instead of
+	// silently never matching.
+	var err error
+	if s.DNSChecks.rdnsWhitelistNets, err = ParseIPList(s.DNSChecks.RDNSWhitelistIPs); err != nil {
+		return fmt.Errorf("dns_checks.rdns_whitelist_ips: %w", err)
+	}
+	if s.Reputation.whitelistNets, err = ParseIPList(s.Reputation.WhitelistIPs); err != nil {
+		return fmt.Errorf("reputation.whitelist_ips: %w", err)
+	}
+
 	// Validate Junk config
 	if s.Junk.ApplyAction != "" {
 		if s.Junk.ApplyAction != "header" && s.Junk.ApplyAction != "reject" && s.Junk.ApplyAction != "warn" && s.Junk.ApplyAction != "subject" {
@@ -353,13 +364,8 @@ func (s *ServerConfig) Validate() error {
 	if !s.ProxyProtocol && len(s.ProxyProtocolTrusted) > 0 {
 		return errors.New("proxy_protocol_trusted is set but proxy_protocol is not enabled")
 	}
-	for _, cidr := range s.ProxyProtocolTrusted {
-		if _, _, err := net.ParseCIDR(cidr); err != nil {
-			// Try as plain IP
-			if net.ParseIP(cidr) == nil {
-				return fmt.Errorf("proxy_protocol_trusted: invalid CIDR or IP %q", cidr)
-			}
-		}
+	if s.proxyTrustedNets, err = ParseIPList(s.ProxyProtocolTrusted); err != nil {
+		return fmt.Errorf("proxy_protocol_trusted: %w", err)
 	}
 
 	// Validate distributed tracking
