@@ -19,3 +19,6 @@ config.toml
 *.pem
 *.key
 test-config.toml
+
+# Local Claude Code settings
+.claude/
