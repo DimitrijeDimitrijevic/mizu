@@ -159,7 +159,10 @@ func NewClient(url, password string, timeout time.Duration, logger *slog.Logger)
 //   - from: MAIL FROM address
 //   - rcpt: RCPT TO addresses
 //   - helo: HELO/EHLO hostname
-func (c *Client) Check(ctx context.Context, traceID, message, clientIP, from string, rcpt []string, helo string) (*CheckResult, error) {
+//   - authenticatedUser: SMTP AUTH username (empty for unauthenticated mail);
+//     sent as rspamd's "User" header so rspamd treats it as authenticated
+//     outbound submission
+func (c *Client) Check(ctx context.Context, traceID, message, clientIP, from string, rcpt []string, helo, authenticatedUser string) (*CheckResult, error) {
 	msgBytes := []byte(message)
 
 	// rspamd /checkv2 is effectively idempotent, but POSTs are not retried
@@ -167,10 +170,10 @@ func (c *Client) Check(ctx context.Context, traceID, message, clientIP, from str
 	// workers faster than our IdleConnTimeout) surfaces here as RST or EOF
 	// mid-response. Retry once on those transport-level glitches before
 	// surfacing the error.
-	bodyBytes, status, err := c.doCheckOnce(ctx, traceID, msgBytes, clientIP, from, rcpt, helo)
+	bodyBytes, status, err := c.doCheckOnce(ctx, traceID, msgBytes, clientIP, from, rcpt, helo, authenticatedUser)
 	if err != nil && isBrokenConnErr(err) {
 		c.Logger.Debug("Retrying rspamd request after broken connection", "error", err)
-		bodyBytes, status, err = c.doCheckOnce(ctx, traceID, msgBytes, clientIP, from, rcpt, helo)
+		bodyBytes, status, err = c.doCheckOnce(ctx, traceID, msgBytes, clientIP, from, rcpt, helo, authenticatedUser)
 	}
 	if err != nil {
 		return nil, err
@@ -258,7 +261,7 @@ func (c *Client) Check(ctx context.Context, traceID, message, clientIP, from str
 // response body and status code. Transport-level failures are returned
 // wrapped with the existing "rspamd request failed" / "failed to read
 // rspamd response" prefixes so the caller can decide whether to retry.
-func (c *Client) doCheckOnce(ctx context.Context, traceID string, msgBytes []byte, clientIP, from string, rcpt []string, helo string) ([]byte, int, error) {
+func (c *Client) doCheckOnce(ctx context.Context, traceID string, msgBytes []byte, clientIP, from string, rcpt []string, helo, authenticatedUser string) ([]byte, int, error) {
 	req, err := http.NewRequestWithContext(ctx, "POST", c.URL, bytes.NewReader(msgBytes))
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to create rspamd request: %w", err)
@@ -289,6 +292,15 @@ func (c *Client) doCheckOnce(ctx context.Context, traceID string, msgBytes []byt
 	}
 	if helo != "" {
 		req.Header.Set("Helo", helo)
+	}
+
+	// Pass the SMTP AUTH username as rspamd's "User" header. Rspamd uses this
+	// to identify authenticated senders and apply its authenticated/outbound
+	// settings (skip inbound-only checks, sign outgoing mail with DKIM/ARC).
+	// Empty for unauthenticated relay/inbound mail, in which case the header
+	// is omitted so rspamd scans the message as ordinary inbound traffic.
+	if authenticatedUser != "" {
+		req.Header.Set("User", authenticatedUser)
 	}
 
 	// Add HTTPCrypt authentication if password is configured.

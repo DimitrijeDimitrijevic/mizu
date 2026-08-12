@@ -67,6 +67,7 @@ func TestClient_Check_Spam(t *testing.T) {
 		"spammer@bad.com",
 		[]string{"victim@example.com"},
 		"spammer.bad.com",
+		"",
 	)
 
 	if err != nil {
@@ -123,6 +124,7 @@ func TestClient_Check_Ham(t *testing.T) {
 		"user@example.com",
 		[]string{"recipient@example.com"},
 		"mail.example.com",
+		"",
 	)
 
 	if err != nil {
@@ -165,6 +167,7 @@ func TestClient_Check_QueueIDHeader(t *testing.T) {
 		"user@example.com",
 		[]string{"recipient@example.com"},
 		"mail.example.com",
+		"",
 	)
 	if err != nil {
 		t.Fatalf("Expected no error, got: %v", err)
@@ -197,6 +200,7 @@ func TestClient_Check_QueueIDHeaderOmittedWhenEmpty(t *testing.T) {
 		"user@example.com",
 		[]string{"recipient@example.com"},
 		"mail.example.com",
+		"",
 	)
 	if err != nil {
 		t.Fatalf("Expected no error, got: %v", err)
@@ -204,6 +208,74 @@ func TestClient_Check_QueueIDHeaderOmittedWhenEmpty(t *testing.T) {
 
 	if queueIDPresent {
 		t.Error("Expected no Queue-ID header when trace ID is empty")
+	}
+}
+
+func TestClient_Check_UserHeader(t *testing.T) {
+	// An authenticated username must be forwarded as rspamd's "User" header so
+	// rspamd can recognize authenticated submission as outgoing mail.
+	var receivedUser string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedUser = r.Header.Get("User")
+
+		resp := rspamdResponse{Action: "no action", Score: 0.0, RequiredScore: 5.0}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", 5*time.Second, slog.Default())
+
+	_, err := client.Check(
+		context.Background(),
+		"trace-abc-123",
+		"Subject: Hello\r\n\r\nBody",
+		"10.0.0.1",
+		"user@example.com",
+		[]string{"recipient@example.com"},
+		"mail.example.com",
+		"user@example.com",
+	)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	if receivedUser != "user@example.com" {
+		t.Errorf("Expected User header 'user@example.com', got '%s'", receivedUser)
+	}
+}
+
+func TestClient_Check_UserHeaderOmittedWhenUnauthenticated(t *testing.T) {
+	// Unauthenticated relay/inbound mail must not set a "User" header, otherwise
+	// rspamd would treat inbound traffic as authenticated outbound submission.
+	var userPresent bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, userPresent = r.Header["User"]
+
+		resp := rspamdResponse{Action: "no action", Score: 0.0, RequiredScore: 5.0}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", 5*time.Second, slog.Default())
+
+	_, err := client.Check(
+		context.Background(),
+		"trace-abc-123",
+		"Subject: Hello\r\n\r\nBody",
+		"10.0.0.1",
+		"sender@remote.example",
+		[]string{"recipient@example.com"},
+		"mail.remote.example",
+		"",
+	)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	if userPresent {
+		t.Error("Expected no User header for unauthenticated mail")
 	}
 }
 
@@ -234,6 +306,7 @@ func TestClient_Check_Reject(t *testing.T) {
 		"virus@malware.com",
 		[]string{"victim@example.com"},
 		"malware.com",
+		"",
 	)
 
 	if err != nil {
@@ -285,6 +358,7 @@ func TestClient_Check_HTTPCrypt(t *testing.T) {
 		"user@example.com",
 		[]string{"recipient@example.com"},
 		"mail.example.com",
+		"",
 	)
 
 	if err != nil {
@@ -342,6 +416,7 @@ func TestAdapter_Check(t *testing.T) {
 		"spammer@bad.com",
 		[]string{"victim@example.com"},
 		"spammer.bad.com",
+		"",
 	)
 
 	if err != nil {
@@ -390,6 +465,7 @@ func TestAdapter_Check_RejectOnAction(t *testing.T) {
 		"virus@malware.com",
 		[]string{"victim@example.com"},
 		"malware.com",
+		"",
 	)
 
 	if err != nil {
@@ -432,6 +508,7 @@ func TestAdapter_Check_Defer(t *testing.T) {
 				"sender@example.com",
 				[]string{"victim@example.com"},
 				"example.com",
+				"",
 			)
 
 			if err != nil {
@@ -514,6 +591,7 @@ func TestClient_Check_StringHeaders(t *testing.T) {
 		"sender@example.com",
 		[]string{"recipient@example.com"},
 		"mail.example.com",
+		"",
 	)
 
 	if err != nil {
@@ -563,6 +641,7 @@ func TestClient_Check_ArrayHeaders(t *testing.T) {
 		"sender@example.com",
 		[]string{"recipient@example.com"},
 		"mail.example.com",
+		"",
 	)
 
 	if err != nil {
@@ -621,6 +700,7 @@ func TestClient_Check_ArrayHeaders_OrderRespected(t *testing.T) {
 		"sender@example.com",
 		[]string{"recipient@example.com"},
 		"",
+		"",
 	)
 	if err != nil {
 		t.Fatalf("Expected no error, got: %v", err)
@@ -666,6 +746,7 @@ func TestClient_Check_NullHeaderDropped(t *testing.T) {
 		"",
 		"sender@example.com",
 		[]string{"recipient@example.com"},
+		"",
 		"",
 	)
 	if err != nil {
@@ -747,6 +828,7 @@ func TestClient_Check_RetryOnBrokenConnection(t *testing.T) {
 		"sender@example.com",
 		[]string{"recipient@example.com"},
 		"mail.example.com",
+		"",
 	)
 	if err != nil {
 		t.Fatalf("Expected retry to succeed, got: %v", err)
@@ -802,6 +884,7 @@ func TestClient_Check_StatisticsError504(t *testing.T) {
 		"sender@example.com",
 		[]string{"recipient@example.com"},
 		"mail.example.com",
+		"",
 	)
 
 	if err != nil {
@@ -833,6 +916,7 @@ func TestClient_Check_Non_Statistics504(t *testing.T) {
 		"sender@example.com",
 		[]string{"recipient@example.com"},
 		"mail.example.com",
+		"",
 	)
 
 	if err == nil {

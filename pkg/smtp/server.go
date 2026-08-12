@@ -94,9 +94,13 @@ type RecipientValidationResponse struct {
 	Temporary bool // If true, rejection is temporary (4xx), otherwise permanent (5xx)
 }
 
-// SpamChecker defines the interface for external spam checking (rspamd)
+// SpamChecker defines the interface for external spam checking (rspamd).
+// authenticatedUser is the SMTP AUTH username (empty for unauthenticated
+// relay/inbound mail); it is passed to rspamd as the "User" header so rspamd
+// can recognize authenticated submission as outgoing mail and apply its
+// outbound settings (e.g. skip inbound filtering, sign with DKIM/ARC).
 type SpamChecker interface {
-	Check(ctx context.Context, traceID, message, clientIP, from string, rcpt []string, helo string) (SpamCheckResult, error)
+	Check(ctx context.Context, traceID, message, clientIP, from string, rcpt []string, helo, authenticatedUser string) (SpamCheckResult, error)
 }
 
 // SpamCheckResult represents the result of spam checking
@@ -1629,7 +1633,7 @@ func (s *Session) performPreDeliveryChecks(rawEmail string) error {
 
 	// External spam checking (rspamd)
 	if s.spamChecker != nil {
-		result, err := s.spamChecker.Check(context.Background(), s.traceID, rawEmail, s.remoteAddr, s.from, s.to, s.helo)
+		result, err := s.spamChecker.Check(context.Background(), s.traceID, rawEmail, s.remoteAddr, s.from, s.to, s.helo, s.authenticatedUser)
 		if err != nil {
 			s.Logger.Warn("Spam check failed", "error", err)
 			if s.metrics != nil {
