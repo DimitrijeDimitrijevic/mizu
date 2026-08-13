@@ -3,6 +3,7 @@ package config
 import (
 	"net"
 	"strconv"
+	"strings"
 )
 
 // Config holds all configuration for the SMTP server(s)
@@ -292,6 +293,33 @@ func (s *ServerConfig) UsesSTARTTLS() bool {
 // UsesImplicitTLS returns true if TLS mode is "implicit"
 func (s *ServerConfig) UsesImplicitTLS() bool {
 	return s.TLS.Mode == "implicit"
+}
+
+// NeedsReverseDNS reports whether this server must perform a reverse-DNS (PTR)
+// lookup on connecting clients. The lookup is uncached and runs inside
+// NewSession (again after STARTTLS re-EHLO), so on a slow or absent PTR it
+// stalls every EHLO. It is only worth that latency when something actually
+// consumes the PTR result:
+//   - require_rdns rejects connections that lack a PTR record;
+//   - a reputation PTR-hostname whitelist (whitelist_hosts) matches against it;
+//   - a sender or recipient validation URL interpolates the $ptr placeholder.
+//
+// Submission servers with none of these (the common case) skip the lookup
+// entirely.
+func (s *ServerConfig) NeedsReverseDNS() bool {
+	if s.DNSChecks.RequireRDNS {
+		return true
+	}
+	if s.Reputation.Enabled && len(s.Reputation.WhitelistHosts) > 0 {
+		return true
+	}
+	if s.SenderValidation.Enabled && strings.Contains(s.SenderValidation.URL, "$ptr") {
+		return true
+	}
+	if s.RecipientValidation.Enabled && strings.Contains(s.RecipientValidation.URL, "$ptr") {
+		return true
+	}
+	return false
 }
 
 // ApplyDefaults fills in missing values from defaults

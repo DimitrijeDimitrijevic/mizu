@@ -424,77 +424,86 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 			}
 		}
 
-		// Check reverse DNS (PTR record) - helps prevent spam from compromised hosts
-		// Use context with timeout to prevent hanging on unresponsive DNS servers
-		rdnsCtx, rdnsCancel := context.WithTimeout(context.Background(), time.Duration(be.GlobalConfig.DNS.TimeoutSeconds)*time.Second)
-		names, err := be.DNSResolver.LookupAddr(rdnsCtx, remoteAddr)
-		rdnsCancel()
+		// Reverse DNS (PTR) lookup. LookupAddr is uncached and blocks the EHLO
+		// response (NewSession runs again after STARTTLS re-EHLO, so it can fire
+		// twice per message), so only pay for it when something consumes the PTR:
+		// require_rdns, a reputation PTR-hostname whitelist, or a $ptr placeholder
+		// in a sender/recipient validation URL. Submission servers with none of
+		// these skip it — a slow or absent PTR no longer stalls every send.
+		// When skipped, ptrRecord stays "" and hasRDNS stays true (we don't
+		// penalize an IP for a check we chose not to run).
+		if be.ServerConfig.NeedsReverseDNS() {
+			// Use context with timeout to prevent hanging on unresponsive DNS servers
+			rdnsCtx, rdnsCancel := context.WithTimeout(context.Background(), time.Duration(be.GlobalConfig.DNS.TimeoutSeconds)*time.Second)
+			names, err := be.DNSResolver.LookupAddr(rdnsCtx, remoteAddr)
+			rdnsCancel()
 
-		// Distinguish "no PTR record exists" (NXDOMAIN / empty answer) from
-		// transient lookup failures (timeout, SERVFAIL, network blip). Treating
-		// transient errors as "no PTR" rejects legitimate senders whose PTR is
-		// fine — `dig -x` from another resolver succeeds while Mizu's recursor
-		// happens to fail or time out.
-		//
-		// Stats: every code path below falls through to the shared
-		// RecordConnection call at the end of this rDNS block EXCEPT the
-		// reject path, which returns early and records inline. The hasRDNS
-		// argument reflects best-known state:
-		//   - success → true
-		//   - confirmed no PTR → false
-		//   - transient DNS error → true (optimistic; don't penalize the IP
-		//     for our recursor's problem, matching the fail-open policy)
-		switch classifyRDNSResult(names, err) {
-		case rdnsTransient:
-			be.Logger.Warn("Reverse DNS lookup failed transiently - allowing connection",
-				"server", be.ServerConfig.Name,
-				"remote_addr", remoteAddr,
-				"error", err)
+			// Distinguish "no PTR record exists" (NXDOMAIN / empty answer) from
+			// transient lookup failures (timeout, SERVFAIL, network blip). Treating
+			// transient errors as "no PTR" rejects legitimate senders whose PTR is
+			// fine — `dig -x` from another resolver succeeds while Mizu's recursor
+			// happens to fail or time out.
+			//
+			// Stats: every code path below falls through to the shared
+			// RecordConnection call at the end of this rDNS block EXCEPT the
+			// reject path, which returns early and records inline. The hasRDNS
+			// argument reflects best-known state:
+			//   - success → true
+			//   - confirmed no PTR → false
+			//   - transient DNS error → true (optimistic; don't penalize the IP
+			//     for our recursor's problem, matching the fail-open policy)
+			switch classifyRDNSResult(names, err) {
+			case rdnsTransient:
+				be.Logger.Warn("Reverse DNS lookup failed transiently - allowing connection",
+					"server", be.ServerConfig.Name,
+					"remote_addr", remoteAddr,
+					"error", err)
 
-		case rdnsMissing:
-			hasRDNS = false
+			case rdnsMissing:
+				hasRDNS = false
 
-			// Reject if rDNS is required, unless the IP is whitelisted
-			rdnsAllowReason := "not_required"
-			if be.ServerConfig.DNSChecks.RequireRDNS {
-				if !ipInNets(ip, be.ServerConfig.DNSChecks.RDNSWhitelistNets()) {
-					if be.StatsManager != nil {
-						// Reject returns early; record inline so this connection
-						// still counts toward the IP's connection total.
-						be.StatsManager.RecordConnection(ipStr, false)
-						be.StatsManager.RecordDeniedConnection(ipStr)
+				// Reject if rDNS is required, unless the IP is whitelisted
+				rdnsAllowReason := "not_required"
+				if be.ServerConfig.DNSChecks.RequireRDNS {
+					if !ipInNets(ip, be.ServerConfig.DNSChecks.RDNSWhitelistNets()) {
+						if be.StatsManager != nil {
+							// Reject returns early; record inline so this connection
+							// still counts toward the IP's connection total.
+							be.StatsManager.RecordConnection(ipStr, false)
+							be.StatsManager.RecordDeniedConnection(ipStr)
+						}
+						if be.Metrics != nil {
+							be.Metrics.SMTPMessagesRejected.WithLabelValues(be.ServerConfig.Name, be.ServerConfig.Type, "no_rdns").Inc()
+						}
+
+						be.Logger.Info("Rejecting connection - no reverse DNS",
+							"server", be.ServerConfig.Name,
+							"remote_addr", remoteAddr)
+						return nil, &smtp.SMTPError{
+							Code:         450,
+							EnhancedCode: smtp.EnhancedCode{4, 7, 25},
+							Message:      fmt.Sprintf("no reverse DNS record for IP address %s", ipStr),
+						}
 					}
-					if be.Metrics != nil {
-						be.Metrics.SMTPMessagesRejected.WithLabelValues(be.ServerConfig.Name, be.ServerConfig.Type, "no_rdns").Inc()
-					}
-
-					be.Logger.Info("Rejecting connection - no reverse DNS",
-						"server", be.ServerConfig.Name,
-						"remote_addr", remoteAddr)
-					return nil, &smtp.SMTPError{
-						Code:         450,
-						EnhancedCode: smtp.EnhancedCode{4, 7, 25},
-						Message:      fmt.Sprintf("no reverse DNS record for IP address %s", ipStr),
-					}
+					rdnsAllowReason = "ip_whitelisted"
 				}
-				rdnsAllowReason = "ip_whitelisted"
+				be.Logger.Info("Connection allowed without reverse DNS",
+					"server", be.ServerConfig.Name,
+					"remote_addr", remoteAddr,
+					"reason", rdnsAllowReason)
+
+			case rdnsSuccess:
+				ptrRecord = names[0]
+				be.Logger.Info("Reverse DNS resolved",
+					"server", be.ServerConfig.Name,
+					"remote_addr", remoteAddr,
+					"remote_host", ptrRecord)
+
+			default:
+				// Compile-time exhaustiveness isn't enforced; trip loudly if a new
+				// rdnsResult variant gets added without a corresponding arm here.
+				panic(fmt.Sprintf("unhandled rdnsResult: %d", classifyRDNSResult(names, err)))
 			}
-			be.Logger.Info("Connection allowed without reverse DNS",
-				"server", be.ServerConfig.Name,
-				"remote_addr", remoteAddr,
-				"reason", rdnsAllowReason)
-
-		case rdnsSuccess:
-			ptrRecord = names[0]
-			be.Logger.Info("Reverse DNS resolved",
-				"server", be.ServerConfig.Name,
-				"remote_addr", remoteAddr,
-				"remote_host", ptrRecord)
-
-		default:
-			// Compile-time exhaustiveness isn't enforced; trip loudly if a new
-			// rdnsResult variant gets added without a corresponding arm here.
-			panic(fmt.Sprintf("unhandled rdnsResult: %d", classifyRDNSResult(names, err)))
 		}
 
 		// Record connection in stats
@@ -687,7 +696,7 @@ func (be *Backend) matchHostWhitelist(ptrHost string, whitelistHost string) bool
 type Session struct {
 	conn           *smtp.Conn             // The underlying SMTP connection
 	helo           string                 // HELO/EHLO domain from the client
-	ptr            string                 // Reverse DNS (PTR) record for client IP
+	ptr            string                 // Reverse DNS (PTR) record for client IP; "" when NewSession skipped the lookup. If you add a new consumer of this field, update ServerConfig.NeedsReverseDNS so the lookup still runs.
 	from           string                 // Sender's email address (MAIL FROM)
 	to             []string               // Recipient email addresses (RCPT TO)
 	remoteAddr     string                 // Remote IP:port of the client
