@@ -142,6 +142,10 @@ github.com/migadu/go-message v0.0.0-20250216181611-b9039e0d248f h1:ddb396ZA1QZ2I
 github.com/migadu/go-message v0.0.0-20250216181611-b9039e0d248f/go.mod h1:XpJyL70LwRvq2a8rVbHXikPgKj8+aI0kGdHlg16ibYA=
 github.com/migadu/go-smtp v0.0.0-20260705092127-a9ff9fa2a2bb h1:1zND+Dtupx9fvvKu3bquy62bU4oCXqSLE6Py7OF7flo=
 github.com/migadu/go-smtp v0.0.0-20260705092127-a9ff9fa2a2bb/go.mod h1:ZtRRkbTyp2XTHCA+BmyTFTrj8xY4I+b4McvHxCU2gsQ=
+github.com/migadu/go-smtp v0.0.0-20260814224941-af936c98db16 h1:lbVdHDbPl//1vQLZ/qhDSAv11ktZ94my4LmOJeAVVT0=
+github.com/migadu/go-smtp v0.0.0-20260814224941-af936c98db16/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
+github.com/migadu/go-smtp v0.0.0-20260814230918-b35acbf7828c h1:8Kb9aZZimho1kJFniDYZMBdL+HXuomjVI6nPvDqGvjM=
+github.com/migadu/go-smtp v0.0.0-20260814230918-b35acbf7828c/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
 github.com/migadu/spf v1.0.0 h1:kn/R6zgjERBT/unZz3Bw2wILwWZbKWonheHznenC/4w=
 github.com/migadu/spf v1.0.0/go.mod h1:JFClaN3Qy0tltbfoskOZP6OD0yh9H6AlpM9AAQdYRjM=
 github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421/go.mod h1:6dJC0mAP4ikYIbvyc7fijjWJddQyLn8Ig3JB5CqoB9Q=

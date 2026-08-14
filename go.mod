@@ -23,7 +23,7 @@ require (
 	golang.org/x/net v0.55.0
 )
 
-replace github.com/emersion/go-smtp => github.com/migadu/go-smtp v0.0.0-20260705092127-a9ff9fa2a2bb
+replace github.com/emersion/go-smtp => github.com/migadu/go-smtp v0.0.0-20260814230918-b35acbf7828c
 
 require (
 	github.com/armon/go-metrics v0.4.1 // indirect

@@ -1292,6 +1292,23 @@ func initSenderValidator(serverCfg *config.ServerConfig, logger *slog.Logger) sm
 	return adapter
 }
 
+// applyEhloCompat configures EHLO capability compatibility knobs on the
+// go-smtp server from the per-server config. Kept as a separate function so
+// the config-to-server mapping is unit-testable.
+func applyEhloCompat(server *gosmtp.Server, serverCfg *config.ServerConfig) {
+	// LIMITS (RFC 9422) is suppressed unless explicitly re-enabled: the
+	// extension is young and can confuse client capability parsers.
+	server.DisableLimitsCap = !serverCfg.AdvertiseLimits
+
+	// Obsolete "AUTH=" EHLO line for Microsoft Outlook lineages, which refuse
+	// to attempt AUTH when only the RFC-conformant form is present (Postfix's
+	// broken_sasl_auth_clients; the August 2026 new-Outlook incident). Only
+	// meaningful on submission servers, where AUTH is advertised.
+	if serverCfg.IsSubmission() {
+		server.EnableLegacyAuthCap = serverCfg.LegacyAuthCapEnabled()
+	}
+}
+
 // runSMTPServerInstance runs a single SMTP server instance
 func runSMTPServerInstance(ctx context.Context, serverCfg *config.ServerConfig, be *smtp.Backend, tlsConfig *tls.Config, logger *slog.Logger, successCounter *atomic.Int32) {
 	server := gosmtp.NewServer(be)
@@ -1302,6 +1319,7 @@ func runSMTPServerInstance(ctx context.Context, serverCfg *config.ServerConfig, 
 	server.MaxMessageBytes = int64(serverCfg.MaxMessageSize)
 	server.EnableSMTPUTF8 = true
 	server.MaxRecipients = serverCfg.MaxRecipientsPerMessage
+	applyEhloCompat(server, serverCfg)
 
 	// Enable debug logging if configured
 	if serverCfg.Debug {

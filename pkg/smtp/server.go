@@ -816,10 +816,18 @@ func (s *Session) Helo(hostname string) error {
 }
 
 // heloValidationEnabled reports whether HELO/EHLO hostname validation is
-// enabled for this server. It defaults to true when unset (nil) so validation
-// remains on unless an operator explicitly sets helo_validation = false.
+// enabled for this server. An explicit helo_validation setting always wins.
+// When unset (nil — config.ApplyDefaults normally materializes it), the
+// default is type-aware: enabled on relay (MX) servers where it screens spam
+// bots, disabled on submission servers — authenticated desktop clients
+// (notably Windows Outlook) send their bare machine name as the EHLO
+// argument, and rejecting it locks every such client out (the August 2026
+// Outlook incident).
 func (s *Session) heloValidationEnabled() bool {
-	return s.serverConfig.HELOValidation == nil || *s.serverConfig.HELOValidation
+	if s.serverConfig.HELOValidation != nil {
+		return *s.serverConfig.HELOValidation
+	}
+	return !s.serverConfig.IsSubmission()
 }
 
 // validateHeloHostname checks a HELO/EHLO hostname for security issues.
