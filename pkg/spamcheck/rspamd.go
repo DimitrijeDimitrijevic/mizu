@@ -16,6 +16,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -47,6 +48,7 @@ type CheckResult struct {
 	IsSpam        bool                // True if action is "add header", "rewrite subject", or "reject"
 	AddHeaders    map[string][]string // Headers to add (from milter.add_headers); a key may have multiple values when rspamd asks for the same header to be added more than once (e.g. Authentication-Results)
 	Symbols       map[string]float64  // Triggered spam rules and their scores
+	SMTPMessage   string              // Custom SMTP reply text from rspamd's messages.smtp_message (set via set_pre_result), sanitized to a single line; empty if rspamd sent none
 }
 
 // rspamdResponse represents the JSON response from rspamd HTTP protocol v2
@@ -56,6 +58,13 @@ type rspamdResponse struct {
 	RequiredScore float64                 `json:"required_score"`
 	Symbols       map[string]rspamdSymbol `json:"symbols"`
 	Milter        *rspamdMilter           `json:"milter,omitempty"`
+	// Messages carries rspamd's out-of-band notices. The SMTP reply text a
+	// module sets via task:set_pre_result(action, message, ...) arrives here
+	// under the "smtp_message" key. Kept as RawMessage because rspamd's
+	// protocol has historically encoded this field as both an object and an
+	// array; a tolerant extractor (extractSMTPMessage) avoids failing the
+	// whole decode on the shape we don't expect.
+	Messages json.RawMessage `json:"messages,omitempty"`
 }
 
 // rspamdSymbol represents a triggered spam rule
@@ -217,6 +226,12 @@ func (c *Client) Check(ctx context.Context, traceID, message, clientIP, from str
 	action := strings.ToLower(rspamdResp.Action)
 	result.IsSpam = action == ActionAddHeader || action == ActionRewriteSubject || action == ActionReject
 
+	// Custom SMTP reply text a module attached to the verdict (e.g. the
+	// migadu_counters plugin's "Reached account outgoing limits ..."). Passed
+	// through to the SMTP client on reject/defer; sanitized so it can't inject
+	// extra reply lines.
+	result.SMTPMessage = sanitizeSMTPMessage(extractSMTPMessage(rspamdResp.Messages))
+
 	// Extract headers to add from milter section. Rspamd uses `order` to
 	// disambiguate entries that share a header name (e.g. multiple
 	// Authentication-Results lines for chained ARC instances). JSON array
@@ -357,6 +372,53 @@ func isStatisticsError(body []byte) bool {
 		ErrorDomain string `json:"error_domain"`
 	}
 	return json.Unmarshal(body, &errResp) == nil && errResp.ErrorDomain == "rspamd-statistics"
+}
+
+// extractSMTPMessage pulls the "smtp_message" string out of rspamd's
+// "messages" field. Rspamd normally encodes messages as an object
+// ({"smtp_message": "..."}), but older/other builds have used an array of
+// strings; anything that isn't the object form we understand yields "" rather
+// than an error, so an unexpected shape never fails the surrounding decode.
+func extractSMTPMessage(raw json.RawMessage) string {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return ""
+	}
+	var obj struct {
+		SMTPMessage string `json:"smtp_message"`
+	}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return ""
+	}
+	return obj.SMTPMessage
+}
+
+// sanitizeSMTPMessage makes an rspamd-supplied string safe to use as an SMTP
+// reply message. It collapses any control characters (notably CR/LF, which the
+// SMTP transport would otherwise turn into additional reply lines) to spaces,
+// trims surrounding whitespace, and caps the length so a single reply line
+// stays within the RFC 5321 512-octet limit once the status code and CRLF are
+// added. Truncation happens on a rune boundary so the reply never ends in a
+// partial UTF-8 sequence.
+func sanitizeSMTPMessage(s string) string {
+	if s == "" {
+		return ""
+	}
+	const maxLen = 480 // leave headroom for "NNN X.Y.Z " prefix and CRLF
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		// Replace C0 controls (incl. CR/LF), DEL, and C1 controls with a
+		// space; keep everything else, including non-ASCII that SMTPUTF8
+		// clients accept.
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			r = ' '
+		}
+		if b.Len()+utf8.RuneLen(r) > maxLen {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // Ping checks if the rspamd server is reachable by sending a HEAD request.

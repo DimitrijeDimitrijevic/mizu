@@ -47,10 +47,11 @@ func (a *Adapter) Check(ctx context.Context, traceID, message, clientIP, from st
 	// Copy so we can add the configured spam/ham header without mutating
 	// the rspamd result.
 	adapterResult := smtp.SpamCheckResult{
-		IsSpam:     result.IsSpam,
-		Action:     result.Action,
-		Score:      result.Score,
-		AddHeaders: make(map[string][]string, len(result.AddHeaders)+1),
+		IsSpam:      result.IsSpam,
+		Action:      result.Action,
+		Score:       result.Score,
+		SMTPMessage: result.SMTPMessage,
+		AddHeaders:  make(map[string][]string, len(result.AddHeaders)+1),
 	}
 	maps.Copy(adapterResult.AddHeaders, result.AddHeaders)
 

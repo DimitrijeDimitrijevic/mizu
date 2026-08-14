@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestClient_Check_Spam(t *testing.T) {
@@ -936,4 +937,147 @@ func isHex(s string) bool {
 		}
 	}
 	return true
+}
+
+// TestClient_Check_SMTPMessage verifies that the reply text rspamd attaches to
+// a verdict via set_pre_result (surfaced under messages.smtp_message) is
+// extracted into CheckResult.SMTPMessage. This is what carries, e.g., the
+// migadu_counters plugin's "Reached account outgoing limits for account #N".
+func TestClient_Check_SMTPMessage(t *testing.T) {
+	const want = "Reached account outgoing limits for account #123"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Written as a raw body so it matches rspamd's real object-form
+		// "messages" encoding rather than relying on the Go struct.
+		body := `{"action":"reject","score":15.0,"required_score":5.0,` +
+			`"messages":{"smtp_message":"` + want + `"}}`
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, body)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", 5*time.Second, slog.Default())
+	result, err := client.Check(context.Background(), "t", "Subject: x\r\n\r\ny",
+		"1.2.3.4", "u@example.com", []string{"v@example.com"}, "example.com", "u@example.com")
+	if err != nil {
+		t.Fatalf("Check returned error: %v", err)
+	}
+	if result.SMTPMessage != want {
+		t.Errorf("SMTPMessage = %q, want %q", result.SMTPMessage, want)
+	}
+}
+
+// TestClient_Check_LegacyMessagesArray ensures the legacy array-form "messages"
+// field does not break decoding: we simply get no SMTPMessage rather than an error.
+func TestClient_Check_LegacyMessagesArray(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := `{"action":"reject","score":15.0,"required_score":5.0,"messages":["some notice"]}`
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, body)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", 5*time.Second, slog.Default())
+	result, err := client.Check(context.Background(), "t", "Subject: x\r\n\r\ny",
+		"1.2.3.4", "u@example.com", []string{"v@example.com"}, "example.com", "")
+	if err != nil {
+		t.Fatalf("Check returned error: %v", err)
+	}
+	if result.Action != "reject" {
+		t.Errorf("Action = %q, want reject", result.Action)
+	}
+	if result.SMTPMessage != "" {
+		t.Errorf("SMTPMessage = %q, want empty for array-form messages", result.SMTPMessage)
+	}
+}
+
+func TestExtractSMTPMessage(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"object", `{"smtp_message":"hello"}`, "hello"},
+		{"object_other_keys", `{"other":"x","smtp_message":"hi"}`, "hi"},
+		{"object_no_smtp_message", `{"other":"x"}`, ""},
+		{"array_legacy", `["a","b"]`, ""},
+		{"empty_object", `{}`, ""},
+		{"null", `null`, ""},
+		{"absent", ``, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractSMTPMessage(json.RawMessage(tc.raw))
+			if got != tc.want {
+				t.Errorf("extractSMTPMessage(%s) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSanitizeSMTPMessage(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain", "Reached account outgoing limits", "Reached account outgoing limits"},
+		{"empty", "", ""},
+		{"strips_crlf", "line one\r\nEHLO evil", "line one  EHLO evil"},
+		{"strips_bare_lf", "a\nb", "a b"},
+		{"strips_tab_and_controls", "a\tb\x00c", "a b c"},
+		{"strips_c1_control", "a\u0085b", "a b"}, // U+0085 NEL
+		{"trims_surrounding_ws", "  hi  ", "hi"},
+		{"keeps_unicode", "límite de cuenta", "límite de cuenta"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeSMTPMessage(tc.in)
+			if got != tc.want {
+				t.Errorf("sanitizeSMTPMessage(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			if strings.ContainsAny(got, "\r\n") {
+				t.Errorf("sanitized output still contains CR/LF: %q", got)
+			}
+		})
+	}
+
+	// Over-long input is capped so a single reply line stays within limits,
+	// and truncation must land on a rune boundary (never a partial UTF-8
+	// sequence). The leading ASCII byte misaligns the multibyte runes so a
+	// naive byte-slice cut would split one.
+	long := "x" + strings.Repeat("€", 1000) // '€' is 3 bytes
+	got := sanitizeSMTPMessage(long)
+	if len(got) > 480 {
+		t.Errorf("sanitizeSMTPMessage did not cap length: got %d bytes", len(got))
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("sanitizeSMTPMessage produced invalid UTF-8: %q", got)
+	}
+}
+
+// TestAdapter_Check_SMTPMessagePassthrough verifies the custom reply text flows
+// from the rspamd client through the adapter into the smtp.SpamCheckResult.
+func TestAdapter_Check_SMTPMessagePassthrough(t *testing.T) {
+	const want = "Reached account outgoing limits for account #123"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := `{"action":"reject","score":15.0,"required_score":5.0,` +
+			`"messages":{"smtp_message":"` + want + `"}}`
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, body)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", 5*time.Second, slog.Default())
+	adapter := NewAdapter(client, "X-Junk", "yes", "", "reject")
+	result, err := adapter.Check(context.Background(), "t", "Subject: x\r\n\r\ny",
+		"1.2.3.4", "u@example.com", []string{"v@example.com"}, "example.com", "u@example.com")
+	if err != nil {
+		t.Fatalf("Check returned error: %v", err)
+	}
+	if !result.ShouldReject {
+		t.Error("expected ShouldReject to be true")
+	}
+	if result.SMTPMessage != want {
+		t.Errorf("SMTPMessage = %q, want %q", result.SMTPMessage, want)
+	}
 }
