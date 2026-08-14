@@ -111,6 +111,7 @@ type SpamCheckResult struct {
 	AddHeaders   map[string][]string // Headers to add (from rspamd milter); each key may map to multiple values when rspamd asks for the same header more than once (e.g. Authentication-Results)
 	ShouldReject bool                // True if message should be permanently rejected (5xx) based on action
 	ShouldDefer  bool                // True if message should be temporarily deferred (4xx), e.g. rspamd "soft reject"
+	SMTPMessage  string              // Custom SMTP reply text from rspamd (messages.smtp_message); used on reject/defer when non-empty, else a generic message
 }
 
 // Backend implements smtp.Backend interface for our custom SMTP server.
@@ -1664,10 +1665,17 @@ func (s *Session) performPreDeliveryChecks(rawEmail string) error {
 				if s.metrics != nil {
 					s.metrics.SMTPMessagesRejected.WithLabelValues(s.serverName(), s.serverType(), "spam_soft_reject").Inc()
 				}
+				// Prefer rspamd's own reply text (e.g. "Reached account
+				// incoming limits ... Try again later.") when it set one,
+				// falling back to a generic notice.
+				message := result.SMTPMessage
+				if message == "" {
+					message = "message deferred, please try again later"
+				}
 				return &smtp.SMTPError{
 					Code:         451,
 					EnhancedCode: smtp.EnhancedCode{4, 7, 1},
-					Message:      "message deferred, please try again later",
+					Message:      message,
 				}
 			}
 
@@ -1677,10 +1685,17 @@ func (s *Session) performPreDeliveryChecks(rawEmail string) error {
 				if s.metrics != nil {
 					s.metrics.SMTPMessagesRejected.WithLabelValues(s.serverName(), s.serverType(), "spam_reject").Inc()
 				}
+				// Prefer rspamd's own reply text (e.g. "Reached account
+				// outgoing limits for account #123") when it set one, falling
+				// back to a generic notice.
+				message := result.SMTPMessage
+				if message == "" {
+					message = "message rejected - spam detected"
+				}
 				return &smtp.SMTPError{
 					Code:         550,
 					EnhancedCode: smtp.EnhancedCode{5, 7, 1},
-					Message:      "message rejected - spam detected",
+					Message:      message,
 				}
 			}
 
