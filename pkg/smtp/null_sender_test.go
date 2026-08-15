@@ -1,6 +1,7 @@
 package smtp
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"testing"
@@ -65,7 +66,7 @@ func TestMail_NullSenderRejection(t *testing.T) {
 			}
 
 			// Call Mail with the test sender
-			err := session.Mail(tt.from, &smtp.MailOptions{})
+			err := session.Mail(context.Background(), tt.from, &smtp.MailOptions{})
 
 			if err == nil {
 				t.Errorf("Expected error for sender '%s', but got nil", tt.from)
@@ -135,7 +136,7 @@ func TestMail_NullSenderPreventsBackscatter(t *testing.T) {
 	}
 
 	// Attempt to send with null sender (typical bounce message format)
-	err := session.Mail("", &smtp.MailOptions{})
+	err := session.Mail(context.Background(), "", &smtp.MailOptions{})
 
 	if err == nil {
 		t.Fatal("Expected null sender to be rejected to prevent backscatter, but it was accepted")

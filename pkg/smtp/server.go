@@ -941,7 +941,7 @@ func (s *Session) setCommandTimeout(timeout time.Duration) error {
 
 // Mail is called for the MAIL FROM command.
 // This sets the envelope sender for the SMTP transaction.
-func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
+func (s *Session) Mail(ctx context.Context, from string, opts *smtp.MailOptions) error {
 	// Reject null sender <> (bounce messages) to prevent backscatter
 	// Check this FIRST before any other processing for security
 	if s.serverConfig.Junk.RejectNullSender && (from == "" || from == "<>") {
@@ -1215,7 +1215,7 @@ func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
 
 // Rcpt is called for the RCPT TO command.
 // This validates and adds recipients to the envelope.
-func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
+func (s *Session) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) error {
 	// Set timeout for this command
 	if err := s.setCommandTimeout(ProcessingTimeout); err != nil {
 		return err
@@ -1341,7 +1341,7 @@ func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
 
 // Data is called when the email body is received.
 // This is where we process the message headers and body, perform validation, and forward the email.
-func (s *Session) Data(r io.Reader) (err error) {
+func (s *Session) Data(ctx context.Context, r io.Reader) (err error) {
 	// 1. Perform initial checks and read the message data from the client.
 	rawEmail, err := s.readMessageData(r)
 	if err != nil {

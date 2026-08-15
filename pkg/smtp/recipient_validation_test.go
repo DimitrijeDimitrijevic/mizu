@@ -71,7 +71,7 @@ func TestRecipientValidation_TemporaryFailure(t *testing.T) {
 	}
 
 	// Try RCPT TO - should get temporary failure (450)
-	err := session.Rcpt("recipient@example.com", nil)
+	err := session.Rcpt(context.Background(), "recipient@example.com", nil)
 	if err == nil {
 		t.Fatal("Expected RCPT TO to fail with temporary error")
 	}
@@ -136,7 +136,7 @@ func TestRecipientValidation_PermanentFailure(t *testing.T) {
 	}
 
 	// Try RCPT TO - should get permanent failure (550)
-	err := session.Rcpt("nonexistent@example.com", nil)
+	err := session.Rcpt(context.Background(), "nonexistent@example.com", nil)
 	if err == nil {
 		t.Fatal("Expected RCPT TO to fail with permanent error")
 	}
@@ -201,7 +201,7 @@ func TestRecipientValidation_Accepted(t *testing.T) {
 	}
 
 	// Try RCPT TO - should succeed
-	err := session.Rcpt("recipient@example.com", nil)
+	err := session.Rcpt(context.Background(), "recipient@example.com", nil)
 	if err != nil {
 		t.Fatalf("Expected RCPT TO to succeed, got error: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestRecipientValidation_TemporaryWithPlainText(t *testing.T) {
 	}
 
 	// Try RCPT TO - should get temporary failure with plain text message
-	err := session.Rcpt("recipient@example.com", nil)
+	err := session.Rcpt(context.Background(), "recipient@example.com", nil)
 	if err == nil {
 		t.Fatal("Expected RCPT TO to fail with temporary error")
 	}
@@ -310,7 +310,7 @@ func TestRecipientValidation_TemporaryDefault(t *testing.T) {
 	}
 
 	// Try RCPT TO - should get temporary failure with default message
-	err := session.Rcpt("recipient@example.com", nil)
+	err := session.Rcpt(context.Background(), "recipient@example.com", nil)
 	if err == nil {
 		t.Fatal("Expected RCPT TO to fail with temporary error")
 	}

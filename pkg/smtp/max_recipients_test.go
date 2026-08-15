@@ -38,14 +38,14 @@ func TestMaxRecipientsPerMessage(t *testing.T) {
 	// Add recipients up to the limit
 	for i := 1; i <= 3; i++ {
 		recipient := "user" + string(rune('0'+i)) + "@example.com"
-		if err := session.Rcpt(recipient, nil); err != nil {
+		if err := session.Rcpt(context.Background(), recipient, nil); err != nil {
 			t.Fatalf("RCPT TO #%d failed: %v", i, err)
 		}
 		t.Logf("✓ Recipient #%d accepted: %s", i, recipient)
 	}
 
 	// Try to add 4th recipient - should be rejected
-	err := session.Rcpt("user4@example.com", nil)
+	err := session.Rcpt(context.Background(), "user4@example.com", nil)
 	if err == nil {
 		t.Fatal("Expected RCPT TO to fail after max recipients, but it succeeded")
 	}
@@ -95,7 +95,7 @@ func TestMaxRecipientsDefaultValue(t *testing.T) {
 	// Add 10 recipients (should work since default is 100)
 	for i := 1; i <= 10; i++ {
 		recipient := "user" + string(rune('0'+i)) + "@example.com"
-		if err := session.Rcpt(recipient, nil); err != nil {
+		if err := session.Rcpt(context.Background(), recipient, nil); err != nil {
 			t.Fatalf("RCPT TO #%d failed with default limit: %v", i, err)
 		}
 	}
@@ -131,7 +131,7 @@ func TestMaxRecipientsReset(t *testing.T) {
 
 	// First transaction - add 3 recipients
 	for i := 1; i <= 3; i++ {
-		if err := session.Rcpt("user"+string(rune('0'+i))+"@example.com", nil); err != nil {
+		if err := session.Rcpt(context.Background(), "user"+string(rune('0'+i))+"@example.com", nil); err != nil {
 			t.Fatalf("RCPT TO #%d failed: %v", i, err)
 		}
 	}
@@ -145,7 +145,7 @@ func TestMaxRecipientsReset(t *testing.T) {
 
 	// Second transaction - should accept 3 more recipients
 	for i := 1; i <= 3; i++ {
-		if err := session.Rcpt("newuser"+string(rune('0'+i))+"@example.com", nil); err != nil {
+		if err := session.Rcpt(context.Background(), "newuser"+string(rune('0'+i))+"@example.com", nil); err != nil {
 			t.Fatalf("RCPT TO #%d (2nd transaction) failed: %v", i, err)
 		}
 	}

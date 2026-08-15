@@ -92,7 +92,7 @@ func TestMail_SenderValidation_Accept(t *testing.T) {
 	}
 
 	// Should accept the sender
-	err := session.Mail("sender@example.com", &smtp.MailOptions{})
+	err := session.Mail(context.Background(), "sender@example.com", &smtp.MailOptions{})
 	if err != nil {
 		t.Errorf("Expected sender to be accepted, got error: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestMail_SenderValidation_Reject(t *testing.T) {
 	}
 
 	// Should reject the sender
-	err := session.Mail("unauthorized@example.com", &smtp.MailOptions{})
+	err := session.Mail(context.Background(), "unauthorized@example.com", &smtp.MailOptions{})
 	if err == nil {
 		t.Fatal("Expected sender to be rejected, but it was accepted")
 	}
@@ -217,7 +217,7 @@ func TestMail_SenderValidation_TemporaryFailure(t *testing.T) {
 	}
 
 	// Should return temporary failure
-	err := session.Mail("sender@example.com", &smtp.MailOptions{})
+	err := session.Mail(context.Background(), "sender@example.com", &smtp.MailOptions{})
 	if err == nil {
 		t.Fatal("Expected error when validation service fails, but got nil")
 	}
@@ -284,7 +284,7 @@ func TestMail_SenderValidation_Disabled(t *testing.T) {
 	}
 
 	// Should accept because validation is disabled
-	err := session.Mail("sender@example.com", &smtp.MailOptions{})
+	err := session.Mail(context.Background(), "sender@example.com", &smtp.MailOptions{})
 	if err != nil {
 		t.Errorf("Expected sender to be accepted (validation disabled), got error: %v", err)
 	}
@@ -375,7 +375,7 @@ func TestMail_SenderValidation_Integration(t *testing.T) {
 			ctx:             context.Background(),
 		}
 
-		err := session.Mail("authorized@example.com", &smtp.MailOptions{})
+		err := session.Mail(context.Background(), "authorized@example.com", &smtp.MailOptions{})
 		if err != nil {
 			t.Errorf("Expected authorized sender to be accepted, got error: %v", err)
 		}
@@ -424,7 +424,7 @@ func TestMail_SenderValidation_Integration(t *testing.T) {
 			ctx:             context.Background(),
 		}
 
-		err := session.Mail("blocked@example.com", &smtp.MailOptions{})
+		err := session.Mail(context.Background(), "blocked@example.com", &smtp.MailOptions{})
 		if err == nil {
 			t.Fatal("Expected blocked sender to be rejected")
 		}
