@@ -604,3 +604,72 @@ func TestValidateConfig_TLSProvider(t *testing.T) {
 func contains(s, substr string) bool {
 	return strings.Contains(s, substr)
 }
+
+func TestValidateConfig_MaxMessageSize(t *testing.T) {
+	baseCfg := func(size int) Config {
+		cfg := DefaultConfig()
+		cfg.Local = true
+		cfg.Storage.Backend = "filesystem"
+		cfg.Storage.FilesystemPath = "/tmp/mizu"
+		cfg.Servers = []ServerConfig{
+			{
+				Name:       "relay",
+				Type:       "relay",
+				ListenAddr: ":25",
+				Hostname:   "test.example.com",
+				Delivery: DeliveryConfig{
+					URL:                "https://test.com",
+					AuthToken:          "test-token",
+					MaxRetryAttempts:   3,
+					HTTPTimeoutSeconds: 30,
+				},
+			},
+		}
+		if size > 0 {
+			cfg.Servers[0].MaxMessageSize = size
+		}
+		return cfg
+	}
+
+	t.Run("default applies and passes", func(t *testing.T) {
+		cfg := baseCfg(0)
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("expected no error with default size, got: %v", err)
+		}
+	})
+
+	t.Run("unset per-server inherits safe default", func(t *testing.T) {
+		// A per-server 0 (or unset) means "inherit from defaults"; with the
+		// standard 25 MiB default this is safe and must pass.
+		cfg := baseCfg(1)
+		cfg.Servers[0].MaxMessageSize = 0
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("expected inherited default to pass, got: %v", err)
+		}
+	})
+
+	t.Run("unlimited defaults inherited rejected", func(t *testing.T) {
+		cfg := baseCfg(1)
+		cfg.Servers[0].MaxMessageSize = 0 // inherit from defaults
+		cfg.Defaults.MaxMessageSize = 0   // explicitly unlimited defaults
+		err := cfg.Validate()
+		if err == nil || !contains(err.Error(), "max_message_size") {
+			t.Errorf("expected max_message_size error, got: %v", err)
+		}
+	})
+
+	t.Run("oversized limit rejected", func(t *testing.T) {
+		cfg := baseCfg(MaxMessageSizeLimit + 1)
+		err := cfg.Validate()
+		if err == nil || !contains(err.Error(), "max_message_size") {
+			t.Errorf("expected max_message_size error, got: %v", err)
+		}
+	})
+
+	t.Run("ceiling accepted", func(t *testing.T) {
+		cfg := baseCfg(MaxMessageSizeLimit)
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("expected no error at ceiling, got: %v", err)
+		}
+	})
+}

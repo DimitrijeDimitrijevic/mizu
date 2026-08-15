@@ -101,6 +101,18 @@ func (c *Config) Validate() error {
 		if err := c.Servers[i].Validate(); err != nil {
 			return fmt.Errorf("server '%s': %w", c.Servers[i].Name, err)
 		}
+
+		// Validate the effective max message size (defaults already applied, so
+		// this covers a per-server override and an inherited defaults value
+		// alike). A zero ("unlimited") limit is a memory-DoS foot-gun — the whole
+		// message is buffered in RAM per session and again per recipient during
+		// delivery — so it is rejected outright, and a ceiling caps the blast
+		// radius of a misconfigured large limit.
+		if size := c.Servers[i].MaxMessageSize; size <= 0 {
+			return fmt.Errorf("server '%s': max_message_size must be a positive byte limit - messages are buffered in memory, \"unlimited\" (0) is not supported", c.Servers[i].Name)
+		} else if size > MaxMessageSizeLimit {
+			return fmt.Errorf("server '%s': max_message_size must be <= %d MiB (got %d bytes)", c.Servers[i].Name, MaxMessageSizeLimit/(1024*1024), size)
+		}
 	}
 
 	// Check for port conflicts

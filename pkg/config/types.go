@@ -30,6 +30,12 @@ type DefaultsConfig struct {
 	MaxConnections         int    `toml:"max_connections"`          // Default max total connections per server
 }
 
+// MaxMessageSizeLimit is the hard ceiling on a server's max_message_size.
+// Messages are fully buffered in memory (once per session during DATA, and
+// again per recipient during delivery), so a limit beyond this is a
+// memory-exhaustion risk regardless of what the operator asked for.
+const MaxMessageSizeLimit = 100 * 1024 * 1024 // 100 MiB
+
 // ServerConfig defines a single SMTP server instance
 type ServerConfig struct {
 	// === Identity ===
