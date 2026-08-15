@@ -78,7 +78,7 @@ func TestCircuitBreakerIntegration_OpenReturns451(t *testing.T) {
 			traceID:        fmt.Sprintf("trace-%d", i),
 		}
 
-		err := session.deliverSynchronous("Subject: Test\r\n\r\nTest email")
+		err := session.deliverSynchronous(context.Background(), "Subject: Test\r\n\r\nTest email")
 		if err == nil {
 			t.Fatal("Expected delivery to fail, but it succeeded")
 		}
@@ -120,7 +120,7 @@ func TestCircuitBreakerIntegration_OpenReturns451(t *testing.T) {
 		traceID:        "trace-open",
 	}
 
-	err := session.deliverSynchronous("Subject: Test during open circuit\r\n\r\nTest email")
+	err := session.deliverSynchronous(context.Background(), "Subject: Test during open circuit\r\n\r\nTest email")
 	if err == nil {
 		t.Fatal("Expected delivery to fail when circuit is open")
 	}
@@ -178,7 +178,7 @@ func TestCircuitBreakerIntegration_OpenReturns451(t *testing.T) {
 		traceID:        "trace-recovery-1",
 	}
 
-	err = session.deliverSynchronous("Subject: Recovery test\r\n\r\nTest email")
+	err = session.deliverSynchronous(context.Background(), "Subject: Recovery test\r\n\r\nTest email")
 	if err != nil {
 		t.Fatalf("Expected delivery to succeed in half-open state, got error: %v", err)
 	}
@@ -187,7 +187,7 @@ func TestCircuitBreakerIntegration_OpenReturns451(t *testing.T) {
 
 	// Need one more success to close the circuit (success_threshold = 2)
 	session.traceID = "trace-recovery-2"
-	err = session.deliverSynchronous("Subject: Recovery test 2\r\n\r\nTest email")
+	err = session.deliverSynchronous(context.Background(), "Subject: Recovery test 2\r\n\r\nTest email")
 	if err != nil {
 		t.Fatalf("Expected delivery to succeed, got error: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestCircuitBreakerIntegration_GenericFailureReturns451(t *testing.T) {
 		traceID:        "trace-permanent",
 	}
 
-	err := session.deliverSynchronous("Subject: Test\r\n\r\nTest email")
+	err := session.deliverSynchronous(context.Background(), "Subject: Test\r\n\r\nTest email")
 	if err == nil {
 		t.Fatal("Expected delivery to fail with 400 error")
 	}
@@ -333,7 +333,7 @@ func TestCircuitBreakerIntegration_4xxErrorsDoNotTriggerCircuit(t *testing.T) {
 		distTracker:    nil, // No distributed tracker (404 falls through to generic error)
 	}
 
-	err := session.deliverSynchronous("Subject: Test\r\n\r\nTest email")
+	err := session.deliverSynchronous(context.Background(), "Subject: Test\r\n\r\nTest email")
 	if err == nil {
 		t.Fatal("Expected delivery to fail with 404 error")
 	}

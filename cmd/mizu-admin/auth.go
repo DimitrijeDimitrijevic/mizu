@@ -30,7 +30,7 @@ const (
 // It resolves the SMTP AUTH backend URL (rcptd's /auth) from the Mizu config —
 // the exact endpoint Mizu queries during SMTP AUTH — fetches the user's password
 // hashes and allowed_from list, and, if a password is supplied, verifies it
-// locally via shared/passwd (the same implementation Mizu uses at auth time,
+// locally via migadu/passwd (the same implementation Mizu uses at auth time,
 // covering bcrypt/BLF-CRYPT/SSHA512/SHA512). The plaintext password is never
 // sent to the backend.
 func cmdAuth() {

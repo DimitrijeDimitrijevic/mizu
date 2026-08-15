@@ -579,8 +579,12 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	// Create session context with deadline
 	ctx, cancel := context.WithTimeout(context.Background(), SessionDeadline)
 
+	// Capture the raw connection once, here, where no go-smtp lock is held.
+	// Session callbacks use it for deadlines instead of smtp.Conn.Conn().
+	netConn := c.Conn()
+
 	// Set initial idle timeout
-	if err := c.Conn().SetDeadline(time.Now().Add(IdleTimeout)); err != nil {
+	if err := netConn.SetDeadline(time.Now().Add(IdleTimeout)); err != nil {
 		cancel()
 		be.Logger.Error("Failed to set deadline", "error", err)
 		return nil, ErrInternalServerError
@@ -591,6 +595,7 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 
 	session := &Session{
 		conn:               c,
+		netConn:            netConn,
 		helo:               "",
 		ptr:                ptrRecord,
 		from:               "",
@@ -696,6 +701,7 @@ func (be *Backend) matchHostWhitelist(ptrHost string, whitelistHost string) bool
 // It tracks the SMTP conversation state and enforces protocol requirements.
 type Session struct {
 	conn           *smtp.Conn             // The underlying SMTP connection
+	netConn        net.Conn               // Raw connection captured at session creation, for deadlines (see setCommandTimeout)
 	helo           string                 // HELO/EHLO domain from the client
 	ptr            string                 // Reverse DNS (PTR) record for client IP; "" when NewSession skipped the lookup. If you add a new consumer of this field, update ServerConfig.NeedsReverseDNS so the lookup still runs.
 	from           string                 // Sender's email address (MAIL FROM)
@@ -916,10 +922,19 @@ func (s *Session) updateTLSState() {
 	}
 }
 
-// setCommandTimeout sets the deadline for the current command
+// setCommandTimeout sets the deadline for the current command.
+//
+// The deadline is set on s.netConn, captured once at session creation, rather
+// than through smtp.Conn.Conn(). That accessor takes go-smtp's per-connection
+// lock, and go-smtp calls Session.Reset (which calls this) from Conn.reset;
+// re-entering the lock from a session callback deadlocks the connection
+// goroutine for good. go-smtp no longer holds the lock across Reset, but not
+// depending on that keeps every session callback safe to call any accessor.
+// The captured value stays current because go-smtp builds a fresh session
+// after STARTTLS swaps the underlying connection.
 func (s *Session) setCommandTimeout(timeout time.Duration) error {
 	// Skip timeout if no connection (e.g., in tests)
-	if s.conn == nil {
+	if s.netConn == nil {
 		return nil
 	}
 
@@ -931,12 +946,25 @@ func (s *Session) setCommandTimeout(timeout time.Duration) error {
 	default:
 		// Set the command timeout
 		deadline := time.Now().Add(timeout)
-		if err := s.conn.Conn().SetDeadline(deadline); err != nil {
+		if err := s.netConn.SetDeadline(deadline); err != nil {
 			s.Logger.Error("Failed to set deadline", "error", err)
 			return ErrInternalServerError
 		}
 		return nil
 	}
+}
+
+// commandContext derives the context for a command's outbound work from the
+// per-command context go-smtp supplies, bounded by the session deadline.
+// go-smtp cancels its context when the transaction ends or the server shuts
+// down; s.ctx carries SessionDeadline. Callers must call the returned cancel.
+func (s *Session) commandContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if s.ctx != nil { // bare test sessions have no session context
+		if deadline, ok := s.ctx.Deadline(); ok {
+			return context.WithDeadline(ctx, deadline)
+		}
+	}
+	return context.WithCancel(ctx)
 }
 
 // Mail is called for the MAIL FROM command.
@@ -1018,7 +1046,9 @@ func (s *Session) Mail(ctx context.Context, from string, opts *smtp.MailOptions)
 
 	// Perform sender validation if enabled (skip for authenticated sessions - already validated via allowed_from)
 	if !s.isAuthenticated && s.senderValidator != nil && s.serverConfig.SenderValidation.Enabled {
-		result, err := s.senderValidator.ValidateWithContext(s.ctx, s.remoteAddr, s.ptr, s.helo, from, s.authenticatedUser)
+		cmdCtx, cancel := s.commandContext(ctx)
+		result, err := s.senderValidator.ValidateWithContext(cmdCtx, s.remoteAddr, s.ptr, s.helo, from, s.authenticatedUser)
+		cancel()
 		if err != nil {
 			s.Logger.Warn("Sender validation failed", "from", from, "authenticated_user", s.authenticatedUser, "error", err)
 			// Treat validation errors as temporary failures
@@ -1282,7 +1312,9 @@ func (s *Session) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) e
 
 	// Perform recipient validation if enabled
 	if s.recipientValidator != nil && s.serverConfig.RecipientValidation.Enabled {
-		result, err := s.recipientValidator.ValidateWithContext(s.ctx, s.remoteAddr, s.ptr, s.helo, s.from, to)
+		cmdCtx, cancel := s.commandContext(ctx)
+		result, err := s.recipientValidator.ValidateWithContext(cmdCtx, s.remoteAddr, s.ptr, s.helo, s.from, to)
+		cancel()
 		if err != nil {
 			s.Logger.Warn("Recipient validation failed", "to", to, "error", err)
 			// Treat validation errors as temporary failures
@@ -1354,14 +1386,17 @@ func (s *Session) Data(ctx context.Context, r io.Reader) (err error) {
 		return s.handleLocalMode(rawEmail)
 	}
 
+	cmdCtx, cancel := s.commandContext(ctx)
+	defer cancel()
+
 	// 3. Perform pre-delivery validation (headers, DMARC, etc.).
 	// This may mark the message as junk or return a hard rejection error.
-	if err := s.performPreDeliveryChecks(rawEmail); err != nil {
+	if err := s.performPreDeliveryChecks(cmdCtx, rawEmail); err != nil {
 		return err
 	}
 
 	// 4. Attempt to deliver the message to the final destination.
-	if err := s.deliverMessage(rawEmail); err != nil {
+	if err := s.deliverMessage(cmdCtx, rawEmail); err != nil {
 		return err
 	}
 
@@ -1458,7 +1493,7 @@ func (s *Session) handleLocalMode(rawEmail string) error {
 
 // performPreDeliveryChecks runs all content validation checks (headers, DMARC).
 // It may mark the message as junk or return an SMTPError for a hard rejection.
-func (s *Session) performPreDeliveryChecks(rawEmail string) error {
+func (s *Session) performPreDeliveryChecks(ctx context.Context, rawEmail string) error {
 	// Mail loop detection (check before other validations to prevent wasting resources)
 	loopDetectionEnabled := s.serverConfig.Validation.LoopDetection != nil && *s.serverConfig.Validation.LoopDetection
 	if loopDetectionEnabled {
@@ -1528,7 +1563,7 @@ func (s *Session) performPreDeliveryChecks(rawEmail string) error {
 			txtResolver = s.dnsResolver
 		}
 		lookupTimeout := time.Duration(s.globalConfig.DNS.TimeoutSeconds) * time.Second
-		dmarcResult, err = validation.CheckDMARC(s.ctx, rawEmail, s.spfResult, quarantineAction, txtResolver, lookupTimeout, s.Logger)
+		dmarcResult, err = validation.CheckDMARC(ctx, rawEmail, s.spfResult, quarantineAction, txtResolver, lookupTimeout, s.Logger)
 	}
 	s.dmarcResult = dmarcResult
 	if err != nil {
@@ -1651,7 +1686,7 @@ func (s *Session) performPreDeliveryChecks(rawEmail string) error {
 
 	// External spam checking (rspamd)
 	if s.spamChecker != nil {
-		result, err := s.spamChecker.Check(context.Background(), s.traceID, rawEmail, s.remoteAddr, s.from, s.to, s.helo, s.authenticatedUser)
+		result, err := s.spamChecker.Check(ctx, s.traceID, rawEmail, s.remoteAddr, s.from, s.to, s.helo, s.authenticatedUser)
 		if err != nil {
 			s.Logger.Warn("Spam check failed", "error", err)
 			if s.metrics != nil {
@@ -1725,7 +1760,7 @@ func (s *Session) performPreDeliveryChecks(rawEmail string) error {
 // deliverMessage attempts to post the email to the destination endpoint.
 // It translates delivery errors into appropriate SMTP temporary or permanent failure codes.
 // It also checks the recipient cache before attempting delivery and caches 404/403 responses.
-func (s *Session) deliverMessage(rawEmail string) error {
+func (s *Session) deliverMessage(ctx context.Context, rawEmail string) error {
 	// Step 1: Inject Received and X-Mizu-* headers
 	// This must happen BEFORE ARC signing so the signature covers these headers
 	tlsVersionStr := "none"
@@ -1808,16 +1843,16 @@ func (s *Session) deliverMessage(rawEmail string) error {
 
 	// ARC signing removed - Mizu is SMTP-to-HTTP relay, never forwards messages
 	// Deliver message synchronously (no ARC signing needed)
-	return s.deliverSynchronous(emailWithHeaders)
+	return s.deliverSynchronous(ctx, emailWithHeaders)
 }
 
 // deliverSynchronous handles synchronous delivery
-func (s *Session) deliverSynchronous(signedEmail string) error {
+func (s *Session) deliverSynchronous(ctx context.Context, signedEmail string) error {
 	// Per-recipient POST to Mailqueuer. Each request is atomic: one recipient,
 	// one queue message, one S3 object. On first failure, stop and return the
 	// error — the sending MTA will retry all recipients.
 	for _, recipient := range s.to {
-		if err := s.deliverToRecipient(signedEmail, recipient); err != nil {
+		if err := s.deliverToRecipient(ctx, signedEmail, recipient); err != nil {
 			return err
 		}
 	}
@@ -1826,7 +1861,7 @@ func (s *Session) deliverSynchronous(signedEmail string) error {
 	return nil
 }
 
-func (s *Session) deliverToRecipient(signedEmail string, recipient string) error {
+func (s *Session) deliverToRecipient(ctx context.Context, signedEmail string, recipient string) error {
 	// Check recipient cache first (if distributed tracking is enabled)
 	if s.distTracker != nil {
 		if found, isBlocked, reason := s.distTracker.IsRecipientCached(recipient); found {
@@ -1844,7 +1879,7 @@ func (s *Session) deliverToRecipient(signedEmail string, recipient string) error
 	emailForRecipient := addEnvelopeToHeader(signedEmail, recipient)
 
 	err := poster.PostEmailToDestinationWithContext(
-		s.ctx,
+		ctx,
 		emailForRecipient,
 		s.serverConfig.Delivery.URL,
 		s.serverConfig.Delivery.AuthToken,

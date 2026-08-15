@@ -71,7 +71,7 @@ func TestMultipleRecipients_DeliveryToBackend(t *testing.T) {
 	}
 
 	emailContent := "Subject: Test Email\r\n\r\nThis is a test email for multiple recipients."
-	err := session.deliverSynchronous(emailContent)
+	err := session.deliverSynchronous(context.Background(), emailContent)
 	if err != nil {
 		t.Fatalf("Expected delivery to succeed, got error: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestMultipleRecipients_SingleRecipientStillWorks(t *testing.T) {
 		traceID:      "test-trace-single",
 	}
 
-	err := session.deliverSynchronous("Subject: Test\r\n\r\nTest")
+	err := session.deliverSynchronous(context.Background(), "Subject: Test\r\n\r\nTest")
 	if err != nil {
 		t.Fatalf("Expected delivery to succeed, got error: %v", err)
 	}
@@ -201,7 +201,7 @@ func TestMultipleRecipients_SecondRecipientFails(t *testing.T) {
 		traceID:      "test-trace-fail",
 	}
 
-	err := session.deliverSynchronous("Subject: Test\r\n\r\nTest")
+	err := session.deliverSynchronous(context.Background(), "Subject: Test\r\n\r\nTest")
 	if err == nil {
 		t.Fatal("Expected delivery to fail when second recipient returns 404")
 	}
