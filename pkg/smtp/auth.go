@@ -24,8 +24,11 @@ type HTTPAuthenticator struct {
 	httpClient  *http.Client
 	logger      *slog.Logger
 
-	// Auth result cache (password-aware, separate positive/negative TTL)
-	// When enabled, handles both positive and negative caching
+	// Auth result cache (password-aware, separate positive/negative TTL).
+	// A hit only short-circuits successful re-authentication of the same
+	// username+password within the positive TTL; negative entries are kept for
+	// observability only and never block a retry (brute-force protection is
+	// the auth rate limiter's job).
 	// When disabled (nil), credentials cache is used without brute force protection
 	authCache *AuthCache
 
@@ -77,14 +80,13 @@ func (a *HTTPAuthenticator) Authenticate(username, password string) (bool, error
 
 // AuthenticateWithIP verifies username and password with client IP for URL interpolation
 func (a *HTTPAuthenticator) AuthenticateWithIP(username, password, remoteIP string) (bool, error) {
-	// Check auth cache first (if enabled)
+	// Check auth cache first (if enabled). A hit only ever short-circuits a
+	// successful re-authentication of the same username+password; misses,
+	// expiries, and negative entries all fall through to the backend. Brute-force
+	// protection is the auth rate limiter's job, never the cache's.
 	if a.authCache != nil {
-		isAuthenticated, found, err := a.authCache.CheckAuth(username, password)
-		if err != nil {
-			// Cached failure - don't check backend
-			return false, nil
-		}
-		if found && isAuthenticated {
+		authenticated, found := a.authCache.CheckAuth(username, password)
+		if found && authenticated {
 			// Cache hit - authentication successful
 			// Still need to check credentials cache for CanSendAs
 			if entry := a.getCredCached(username); entry == nil {

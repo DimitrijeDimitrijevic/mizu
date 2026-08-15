@@ -18,8 +18,8 @@ func TestAuthCache_PositiveCaching(t *testing.T) {
 	password := "correct-password"
 
 	// First check - cache miss
-	authenticated, found, err := cache.CheckAuth(username, password)
-	if found || err != nil {
+	authenticated, found := cache.CheckAuth(username, password)
+	if found {
 		t.Error("Expected cache miss on first check")
 	}
 
@@ -27,8 +27,8 @@ func TestAuthCache_PositiveCaching(t *testing.T) {
 	cache.SetSuccess(username, password)
 
 	// Second check - cache hit
-	authenticated, found, err = cache.CheckAuth(username, password)
-	if !found || !authenticated || err != nil {
+	authenticated, found = cache.CheckAuth(username, password)
+	if !found || !authenticated {
 		t.Error("Expected cache hit with successful authentication")
 	}
 
@@ -48,10 +48,10 @@ func TestAuthCache_NegativeCaching(t *testing.T) {
 	cache.SetFailure(username, password, AuthInvalidPassword)
 
 	// Check - should indicate cached failure (found=false to trigger revalidation)
-	authenticated, found, err := cache.CheckAuth(username, password)
-	if authenticated || found || err != nil {
-		t.Errorf("Expected negative cache to allow revalidation, got authenticated=%v, found=%v, err=%v",
-			authenticated, found, err)
+	authenticated, found := cache.CheckAuth(username, password)
+	if authenticated || found {
+		t.Errorf("Expected negative cache to allow revalidation, got authenticated=%v, found=%v",
+			authenticated, found)
 	}
 
 	t.Logf("✓ Negative caching working correctly")
@@ -71,14 +71,14 @@ func TestAuthCache_PasswordChange(t *testing.T) {
 	cache.SetSuccess(username, password1)
 
 	// Check with password1 - should succeed
-	authenticated, found, err := cache.CheckAuth(username, password1)
-	if !found || !authenticated || err != nil {
+	authenticated, found := cache.CheckAuth(username, password1)
+	if !found || !authenticated {
 		t.Error("Expected cache hit with correct password")
 	}
 
 	// Check with password2 (different password) - should trigger revalidation
-	authenticated, found, err = cache.CheckAuth(username, password2)
-	if authenticated || found || err != nil {
+	authenticated, found = cache.CheckAuth(username, password2)
+	if authenticated || found {
 		t.Error("Expected password change to trigger revalidation")
 	}
 
@@ -99,8 +99,8 @@ func TestAuthCache_PositiveRevalidation(t *testing.T) {
 	cache.SetSuccess(username, password)
 
 	// Immediate check - should use cache
-	authenticated, found, err := cache.CheckAuth(username, password)
-	if !found || !authenticated || err != nil {
+	authenticated, found := cache.CheckAuth(username, password)
+	if !found || !authenticated {
 		t.Error("Expected cache hit immediately after caching")
 	}
 
@@ -108,8 +108,8 @@ func TestAuthCache_PositiveRevalidation(t *testing.T) {
 	time.Sleep(60 * time.Millisecond)
 
 	// Check again - should trigger revalidation due to age
-	authenticated, found, err = cache.CheckAuth(username, password)
-	if authenticated || found || err != nil {
+	authenticated, found = cache.CheckAuth(username, password)
+	if authenticated || found {
 		t.Error("Expected revalidation after revalidation window expires")
 	}
 
@@ -130,7 +130,7 @@ func TestAuthCache_TTLExpiration(t *testing.T) {
 	cache.SetSuccess(username, password)
 
 	// Immediate check - should hit cache
-	_, found, _ := cache.CheckAuth(username, password)
+	_, found := cache.CheckAuth(username, password)
 	if !found {
 		t.Error("Expected cache hit immediately")
 	}
@@ -139,7 +139,7 @@ func TestAuthCache_TTLExpiration(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	// Check again - should miss (expired)
-	_, found, _ = cache.CheckAuth(username, password)
+	_, found = cache.CheckAuth(username, password)
 	if found {
 		t.Error("Expected cache miss after TTL expiration")
 	}
@@ -176,13 +176,13 @@ func TestAuthCache_SizeLimit(t *testing.T) {
 	}
 
 	// user1 should be evicted (cache miss)
-	_, found, _ := cache.CheckAuth("user1@example.com", "password")
+	_, found := cache.CheckAuth("user1@example.com", "password")
 	if found {
 		t.Error("user1 should have been evicted (oldest entry)")
 	}
 
 	// user6 should exist (cache hit)
-	_, found, _ = cache.CheckAuth("user6@example.com", "password")
+	_, found = cache.CheckAuth("user6@example.com", "password")
 	if !found {
 		t.Error("user6 should exist (newest entry)")
 	}
@@ -234,7 +234,7 @@ func TestAuthCache_Invalidate(t *testing.T) {
 	cache.SetSuccess(username, password)
 
 	// Verify cached
-	_, found, _ := cache.CheckAuth(username, password)
+	_, found := cache.CheckAuth(username, password)
 	if !found {
 		t.Error("Expected cache hit")
 	}
@@ -243,7 +243,7 @@ func TestAuthCache_Invalidate(t *testing.T) {
 	cache.Invalidate(username)
 
 	// Should be gone
-	_, found, _ = cache.CheckAuth(username, password)
+	_, found = cache.CheckAuth(username, password)
 	if found {
 		t.Error("Expected cache miss after invalidation")
 	}

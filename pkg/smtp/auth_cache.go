@@ -102,25 +102,27 @@ func (e *AuthCacheEntry) isOld(duration time.Duration) bool {
 
 // CheckAuth attempts to validate authentication using cached data
 // Returns:
-//   - (true, true, nil) on cache hit with successful authentication (authenticated=true, found=true)
-//   - (false, false, nil) if not in cache or needs revalidation (caller should check authenticator)
-//   - (false, true, error) on cached authentication failure (caller should NOT check authenticator)
+//   - (true, true) on cache hit with successful authentication
+//   - (false, false) in every other case: not cached, expired, a negative
+//     (failed-auth) entry, or a positive entry that needs (re)validation.
+//     The caller must verify against the backend; brute-force protection is
+//     the auth rate limiter's job, never the cache's.
 //
 // Uses password-aware revalidation to detect password changes while preventing rapid brute force attempts
-func (c *AuthCache) CheckAuth(username, password string) (authenticated bool, found bool, err error) {
+func (c *AuthCache) CheckAuth(username, password string) (authenticated bool, found bool) {
 	c.mu.RLock()
 	entry, exists := c.entries[username]
 	if !exists {
 		c.mu.RUnlock()
 		atomic.AddUint64(&c.misses, 1)
-		return false, false, nil
+		return false, false
 	}
 
 	// Check if expired
 	if time.Now().After(entry.ExpiresAt) {
 		c.mu.RUnlock()
 		atomic.AddUint64(&c.misses, 1)
-		return false, false, nil
+		return false, false
 	}
 
 	atomic.AddUint64(&c.hits, 1)
@@ -145,7 +147,7 @@ func (c *AuthCache) CheckAuth(username, password string) (authenticated bool, fo
 			"username", username,
 			"same_password", passwordMatches,
 			"age", time.Since(entry.CreatedAt))
-		return false, false, nil
+		return false, false
 	}
 
 	// Positive cache entry - successful authentication previously cached
@@ -157,7 +159,7 @@ func (c *AuthCache) CheckAuth(username, password string) (authenticated bool, fo
 			c.logger.Debug("Auth cache: positive entry revalidation needed (entry too old)",
 				"username", username,
 				"age", time.Since(entry.CreatedAt))
-			return false, false, nil
+			return false, false
 		}
 
 		// Entry is fresh and password matches - return success
@@ -165,7 +167,7 @@ func (c *AuthCache) CheckAuth(username, password string) (authenticated bool, fo
 		c.logger.Debug("Auth cache hit: successful authentication",
 			"username", username,
 			"age", time.Since(entry.CreatedAt))
-		return true, true, nil
+		return true, true
 	} else {
 		// Different password on positive entry - ALWAYS allow revalidation
 		// User might have changed their password, or they're trying a wrong password.
@@ -175,7 +177,7 @@ func (c *AuthCache) CheckAuth(username, password string) (authenticated bool, fo
 		c.logger.Debug("Auth cache: positive entry revalidation allowed (different password)",
 			"username", username,
 			"age", time.Since(entry.CreatedAt))
-		return false, false, nil
+		return false, false
 	}
 }
 
