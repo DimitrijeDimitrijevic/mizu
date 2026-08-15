@@ -311,6 +311,13 @@ func (s *Server) Start() {
 	s.httpServer = &http.Server{
 		Addr:    s.listenAddr,
 		Handler: s.mux,
+		// Timeouts prevent slowloris-style connection exhaustion. WriteTimeout
+		// must exceed the 8s health-check collection deadline in healthHandler
+		// (it is set as a connection deadline when a request starts and covers
+		// handler execution).
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	s.logger.Info(fmt.Sprintf("Starting health/metrics server on %s", s.listenAddr))
@@ -569,9 +576,9 @@ func (c *CheckDestination) CheckHealth() ComponentStatus {
 
 // CheckTLSCertificate checks if TLS certificate is valid and not expiring soon.
 type CheckTLSCertificate struct {
-	ServerName    string // per-server identifier, keeps component names unique
-	DialAddr      string // local listener address to connect to (host:port)
-	SNI           string // server name for SNI + cert verification (the cert hostname)
+	ServerName    string        // per-server identifier, keeps component names unique
+	DialAddr      string        // local listener address to connect to (host:port)
+	SNI           string        // server name for SNI + cert verification (the cert hostname)
 	WarnThreshold time.Duration // Warn if cert expires within this duration
 }
 

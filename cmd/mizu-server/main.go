@@ -164,6 +164,13 @@ func main() {
 				server := &http.Server{
 					Addr:      ":443",
 					TLSConfig: tlsMgr.TLSConfig(),
+					// Bounded I/O so stalled handshakes/requests cannot pin
+					// connections (slowloris). ACME clients complete the handshake
+					// in well under a second; the challenge token is delivered
+					// during the handshake itself.
+					ReadTimeout:  10 * time.Second,
+					WriteTimeout: 10 * time.Second,
+					IdleTimeout:  30 * time.Second,
 				}
 				// Empty cert/key files - TLSConfig.GetCertificate handles everything.
 				if err := server.ListenAndServeTLS("", ""); err != nil {
@@ -174,7 +181,14 @@ func main() {
 			// Start HTTP server on port 80 for HTTP-01 challenges (fallback).
 			concurrency.SafeGo(logger, "acme-http-server", func() {
 				logger.Info("Starting HTTP server for ACME HTTP-01 challenges on :80")
-				if err := http.ListenAndServe(":80", tlsMgr.HTTPHandler()); err != nil {
+				server := &http.Server{
+					Addr:         ":80",
+					Handler:      tlsMgr.HTTPHandler(),
+					ReadTimeout:  10 * time.Second,
+					WriteTimeout: 10 * time.Second,
+					IdleTimeout:  30 * time.Second,
+				}
+				if err := server.ListenAndServe(); err != nil {
 					logger.Error("HTTP-01 challenge server failed", "error", err)
 				}
 			})
