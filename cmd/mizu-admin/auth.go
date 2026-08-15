@@ -12,7 +12,7 @@ import (
 	"migadu/mizu/pkg/config"
 	"migadu/mizu/pkg/smtp"
 
-	"shared/passwd"
+	"github.com/migadu/passwd"
 )
 
 // Auth exit codes. Operational failures (flag parse, config load, transport,

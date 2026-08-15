@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"shared/passwd"
+	"github.com/migadu/passwd"
 )
 
 // HTTPAuthenticator authenticates users via HTTPS GET API with local password verification

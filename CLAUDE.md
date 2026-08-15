@@ -463,10 +463,12 @@ deliveryCfg := serverCfg.Delivery
   - `hashicorp/memberlist` - Distributed cluster coordination
   - `aws/aws-sdk-go-v2` - S3 client (certs and stats sync)
   - `prometheus/client_golang` - Metrics
-  - `shared` (local module, `replace shared => ../shared`) - password hash
-    verification (`shared/passwd`), shared with rcptd/rcptctl. Building mizu
-    requires the sibling `../shared` checkout from the ansible-freebsd3 tree;
-    the Ansible build task provides it next to the clone in `.compile/`.
+  - `github.com/migadu/passwd` (local module, `replace github.com/migadu/passwd
+    => ../passwd`) - password hash verification, shared with rcptd/rcptctl and
+    calserver. Building mizu requires the sibling `../passwd` checkout from the
+    ansible-freebsd3 tree; the Ansible build task provides it next to the clone
+    in `.compile/`. (This and `github.com/migadu/emailutil` replaced the former
+    single `shared` module, now split into one module per package.)
 
 ## Version Information
 
