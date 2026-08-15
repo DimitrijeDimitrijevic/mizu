@@ -57,12 +57,26 @@ type ServerConfig struct {
 	TimeoutSeconds         int `toml:"timeout_seconds"`          // SMTP command timeout (overrides default)
 	ShutdownTimeoutSeconds int `toml:"shutdown_timeout_seconds"` // Graceful shutdown timeout (overrides default)
 
+	// === Client Compatibility ===
+	// LegacyAuthCap advertises the obsolete "AUTH=<mechanisms>" EHLO line in
+	// addition to the standard "AUTH <mechanisms>" capability on submission
+	// servers. Microsoft Outlook lineages look for the legacy form and refuse
+	// to attempt authentication when it is absent (the August 2026 "new
+	// Outlook cannot connect" incident); Postfix ships the same workaround as
+	// broken_sasl_auth_clients. Default: true.
+	LegacyAuthCap *bool `toml:"legacy_auth_cap"`
+	// AdvertiseLimits re-enables the "LIMITS RCPTMAX=..." (RFC 9422) EHLO
+	// capability, advertised when max_recipients_per_message is set. Off by
+	// default: the extension is young and can confuse client capability
+	// parsers. Default: false.
+	AdvertiseLimits bool `toml:"advertise_limits"`
+
 	// === Debugging ===
 	Debug              bool `toml:"debug"`                // Enable SMTP protocol debug logging (shows all SMTP commands and responses)
 	DisableMizuHeaders bool `toml:"disable_mizu_headers"` // Disable X-Mizu-* headers (keeps Received header, removes X-Mizu-Trace-ID, X-Mizu-Authentication-Results, X-Mizu-Junk)
 
 	// === Email Validation ===
-	HELOValidation        *bool  `toml:"helo_validation"`         // Validate HELO/EHLO hostname for security (default: true, set to false to disable)
+	HELOValidation        *bool  `toml:"helo_validation"`         // Validate HELO/EHLO hostname (default: true on relay, false on submission — Windows MUAs send bare machine names; explicit setting wins)
 	SPFCheck              bool   `toml:"spf_check"`               // Enable SPF validation
 	DKIMCheck             bool   `toml:"dkim_check"`              // Enable DKIM validation
 	ARCCheck              bool   `toml:"arc_check"`               // Enable ARC validation
@@ -280,6 +294,13 @@ func (s *ServerConfig) IsSubmission() bool {
 	return s.Type == "submission"
 }
 
+// LegacyAuthCapEnabled reports whether the obsolete "AUTH=" EHLO line should
+// be advertised alongside the standard AUTH capability (default: true; see
+// the LegacyAuthCap field comment for the Outlook background).
+func (s *ServerConfig) LegacyAuthCapEnabled() bool {
+	return s.LegacyAuthCap == nil || *s.LegacyAuthCap
+}
+
 // IsTLSEnabled returns true if TLS is explicitly enabled
 func (s *ServerConfig) IsTLSEnabled() bool {
 	return s.TLS.Enabled
@@ -343,6 +364,13 @@ func (s *ServerConfig) ApplyDefaults(defaults DefaultsConfig) {
 		s.MaxRecipientsPerMessage = 100
 	}
 
+	// LegacyAuthCap defaults to true for Microsoft client compatibility
+	// (uses pointer to detect unset); see the field comment.
+	if s.LegacyAuthCap == nil {
+		trueVal := true
+		s.LegacyAuthCap = &trueVal
+	}
+
 	// Apply validation defaults
 	// LoopDetection defaults to true for safety (uses pointer to detect unset)
 	if s.Validation.LoopDetection == nil {
@@ -350,10 +378,16 @@ func (s *ServerConfig) ApplyDefaults(defaults DefaultsConfig) {
 		s.Validation.LoopDetection = &trueVal
 	}
 
-	// HELOValidation defaults to true for security (uses pointer to detect unset)
+	// HELOValidation defaults by server type (uses pointer to detect unset):
+	// true on relay (MX) servers, where it screens spam bots, and false on
+	// submission servers — authenticated desktop clients (notably Windows
+	// Outlook) send their bare machine name as the EHLO argument, and
+	// rejecting it locks every such client out (the August 2026 Outlook
+	// incident). Postfix likewise never enforces HELO checks on submission.
+	// An explicit helo_validation setting wins for either type.
 	if s.HELOValidation == nil {
-		trueVal := true
-		s.HELOValidation = &trueVal
+		v := !s.IsSubmission()
+		s.HELOValidation = &v
 	}
 }
 
