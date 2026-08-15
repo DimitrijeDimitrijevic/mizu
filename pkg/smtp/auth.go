@@ -560,10 +560,26 @@ type LoginServer struct {
 	step          int
 }
 
-// Next processes the LOGIN authentication handshake
+// Next processes the LOGIN authentication handshake.
+//
+// The exchange has two shapes and BOTH must work. Without an initial response
+// it is the three-step form (`AUTH LOGIN`, "Username:", "Password:"). With one,
+// the client sent its username on the AUTH command itself (RFC 4954 §4 initial
+// response) and waits to be asked only for the password — this is what Outlook
+// and every go-sasl LOGIN client do. go-smtp passes that initial response here;
+// DISCARDING it desynchronizes the exchange: the client answers our "Username:"
+// prompt with its PASSWORD, which we then try as a username, and auth can never
+// succeed.
 func (l *LoginServer) Next(response []byte) (challenge []byte, done bool, err error) {
 	switch l.step {
 	case 0:
+		// Initial response present (non-nil, including the "=" zero-length
+		// form) => it is the username; skip straight to asking for the password.
+		if response != nil {
+			l.username = string(response)
+			l.step = 2
+			return []byte("Password:"), false, nil
+		}
 		// First step: request username
 		l.step = 1
 		return []byte("Username:"), false, nil

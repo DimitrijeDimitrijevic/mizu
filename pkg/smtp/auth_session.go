@@ -120,25 +120,30 @@ func (s *Session) Auth(mech string) (sasl.Server, error) {
 			authenticated, err = s.authenticator.Authenticate(user, password)
 		}
 
-		// Record auth attempt result in rate limiter
-		if s.authRateLimiter != nil {
-			s.authRateLimiter.RecordAuthAttempt(s.ctx, remoteIP, user, authenticated && err == nil)
+		// Only a genuine verdict feeds the brute-force damper. A transient
+		// backend error is neither a success nor a failed guess; counting it
+		// would spend a legitimate user's attempt budget on OUR outage.
+		if s.authRateLimiter != nil && err == nil {
+			s.authRateLimiter.RecordAuthAttempt(s.ctx, remoteIP, user, authenticated)
+		}
+
+		// ERROR IS CHECKED FIRST, and the order is the safety property. The
+		// Authenticator contract is (false, nil) for a definitive rejection and
+		// (true|false, err) for anything transient; judging `authenticated`
+		// first would turn a backend blip into a PERMANENT 535 that makes the
+		// client discard a valid stored password. Any error => temporary 454.
+		if err != nil {
+			s.Logger.Error("Authentication error", "username", user, "error", err)
+			return ErrAuthTemporaryFailure
 		}
 
 		if !authenticated {
-			s.Logger.Warn("Authentication failed", "username", user, "reason", err)
-			return fmt.Errorf("invalid credentials")
-		}
-
-		if err != nil {
-			s.Logger.Error("Authentication error", "username", user, "error", err)
-			// Return a temporary failure error that SASL can understand
-			// The SASL library will convert this to appropriate SMTP response
-			return &smtp.SMTPError{
-				Code:         454,
-				EnhancedCode: smtp.EnhancedCode{4, 7, 0},
-				Message:      "temporary authentication failure: please try again later",
-			}
+			// Permanent: the credential was judged and rejected. RFC 4954 §6's
+			// 535 5.7.8 — a 4xx here tells the client to retry a password that
+			// can never work, and Outlook's setup wizard reads 454 as "server
+			// unavailable" and aborts account creation instead of prompting.
+			s.Logger.Warn("Authentication failed", "username", user)
+			return ErrAuthCredentialsInvalid
 		}
 
 		// Mark session as authenticated
