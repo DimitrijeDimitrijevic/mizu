@@ -164,6 +164,7 @@ func main() {
 				server := &http.Server{
 					Addr:      ":443",
 					TLSConfig: tlsMgr.TLSConfig(),
+					ErrorLog:  logging.NewHTTPErrorLogger(logger, "acme-tls-alpn-01", ":443"),
 					// Bounded I/O so stalled handshakes/requests cannot pin
 					// connections (slowloris). ACME clients complete the handshake
 					// in well under a second; the challenge token is delivered
@@ -184,6 +185,7 @@ func main() {
 				server := &http.Server{
 					Addr:         ":80",
 					Handler:      tlsMgr.HTTPHandler(),
+					ErrorLog:     logging.NewHTTPErrorLogger(logger, "acme-http-01", ":80"),
 					ReadTimeout:  10 * time.Second,
 					WriteTimeout: 10 * time.Second,
 					IdleTimeout:  30 * time.Second,
@@ -856,6 +858,7 @@ func startMetricsServer(cfg *config.Config, logger *slog.Logger) *http.Server {
 	server := &http.Server{
 		Addr:         bind,
 		Handler:      mux,
+		ErrorLog:     logging.NewHTTPErrorLogger(logger, "metrics", bind),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  30 * time.Second,
