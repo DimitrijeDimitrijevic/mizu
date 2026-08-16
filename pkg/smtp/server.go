@@ -32,12 +32,50 @@ import (
 	"github.com/emersion/go-smtp"
 )
 
+// Session timeouts, in the order they bind.
+//
+// The wait for the next command belongs to go-smtp, not to this package:
+// Server.ReadTimeout (config timeout_seconds, RFC 5321 §4.5.3.2.7 requires at
+// least 5 minutes) is re-armed before every command read and therefore
+// overrides whatever deadline a session callback left on the socket. The
+// deadlines below are what remains ours: the DATA body, which go-smtp hands to
+// Session.Data without touching the deadline, and a backstop for deployments
+// that disable go-smtp's timeouts by setting timeout_seconds to 0.
 const (
-	// Session timeouts for security and resource management
-	SessionDeadline   = 5 * time.Minute  // Hard limit for entire SMTP session to prevent hanging connections
-	ProcessingTimeout = 30 * time.Second // Timeout for processing a command after it's received
-	IdleTimeout       = 1 * time.Minute  // Maximum idle time between commands before disconnect
-	DataTimeout       = 2 * time.Minute  // Timeout for receiving email body after DATA command
+	// SessionDeadline caps time spent without completing a transaction, and is
+	// restarted by extendSessionDeadline whenever one completes — a sender
+	// working through a queue on one connection is judged on progress, not on
+	// total connection age. It bounds a client that drips valid commands
+	// forever; a client that simply goes quiet is cut off far sooner by the
+	// per-phase budgets below.
+	SessionDeadline = 30 * time.Minute
+
+	// DataPhaseBudget is what ensureSessionBudget reserves when DATA starts, so
+	// receiving the body and delivering it synchronously is never handed
+	// whatever scrap of the session budget happens to remain. RFC 5321
+	// §4.5.3.2.6 allows 10 minutes for the reply to the end of a DATA transfer
+	// precisely so this work can finish before the sender gives up. It is also
+	// the ceiling on the body read: the rolling deadline below may not push
+	// past the session deadline, or a client dripping one byte at a time could
+	// hold the phase open forever.
+	DataPhaseBudget = 10 * time.Minute
+
+	// DataBlockTimeout bounds how long the client may stall *within* the
+	// message body. It is re-armed on every chunk that arrives (see
+	// rollingDeadlineReader), per RFC 5321 §4.5.3.2.6, which specifies a
+	// per-block rather than a whole-transfer budget. A single deadline over
+	// the entire body would silently turn max_message_size into a minimum
+	// bandwidth requirement (25MB in 2 minutes ≈ 1.7 Mbit/s) and cut off
+	// mobile and other slow uplinks mid-message.
+	DataBlockTimeout = 3 * time.Minute
+
+	// ProcessingTimeout is the socket deadline held while a command handler
+	// runs, and IdleTimeout the one left behind for the wait that follows.
+	// Both are normally superseded by go-smtp's own deadlines; they matter
+	// when those are disabled. Setting either is also where a session's
+	// remaining SessionDeadline budget is checked (see setCommandTimeout).
+	ProcessingTimeout = 30 * time.Second
+	IdleTimeout       = 1 * time.Minute
 )
 
 // generateTraceID creates a unique trace ID for correlating logs and tracking emails through the system.
@@ -576,8 +614,10 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		tlsState = &state
 	}
 
-	// Create session context with deadline
-	ctx, cancel := context.WithTimeout(context.Background(), SessionDeadline)
+	// The session context is cancelled on Logout; the session's time budget is
+	// tracked separately by sessionDeadline, which — unlike a context deadline —
+	// can be restarted as the session makes progress.
+	ctx, cancel := context.WithCancel(context.Background())
 
 	// Capture the raw connection once, here, where no go-smtp lock is held.
 	// Session callbacks use it for deadlines instead of smtp.Conn.Conn().
@@ -629,6 +669,7 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		recipientValidator: be.RecipientValidator, // Recipient validator (nil if disabled)
 		spamChecker:        be.SpamChecker,        // Spam checker (nil if disabled)
 	}
+	session.sessionDeadline.Store(time.Now().Add(SessionDeadline).UnixNano())
 
 	be.Logger.Info("Session created successfully",
 		"server", be.ServerConfig.Name,
@@ -720,13 +761,21 @@ type Session struct {
 	distTracker    *DistributedTracker    // Distributed connection tracker (optional, for cluster-wide limits)
 	rateLimiter    *RateLimiter           // Multi-dimensional rate limiter
 	metrics        *metrics.Metrics       // Prometheus metrics for observability
-	ctx            context.Context        // Session context with deadline for timeout
+	ctx            context.Context        // Session context, cancelled on Logout
 	baseLogger     *slog.Logger           // Logger without session attrs, to rebuild Logger when the trace ID rotates
 	Logger         *slog.Logger           // Structured logger for this session
 	cancel         context.CancelFunc     // Cancel function to clean up resources
-	sessionsWg     *sync.WaitGroup        // WaitGroup to track active sessions for graceful shutdown
-	sessionCount   *atomic.Int64          // Pointer to active session counter for observability
-	logoutOnce     sync.Once              // Ensures Logout cleanup runs exactly once
+
+	// sessionDeadline caps time spent without completing a transaction, as
+	// Unix nanoseconds (zero when unset, as in bare test sessions). Unlike a
+	// context deadline it moves: extendSessionDeadline restarts it on progress
+	// and ensureSessionBudget guarantees room for work about to start. Held
+	// atomically because BDAT runs Session.Data on its own goroutine while the
+	// connection goroutine keeps handling commands.
+	sessionDeadline atomic.Int64
+	sessionsWg      *sync.WaitGroup // WaitGroup to track active sessions for graceful shutdown
+	sessionCount    *atomic.Int64   // Pointer to active session counter for observability
+	logoutOnce      sync.Once       // Ensures Logout cleanup runs exactly once
 
 	// Authentication (for submission servers)
 	isAuthenticated   bool             // Whether user has authenticated via SMTP AUTH
@@ -939,30 +988,68 @@ func (s *Session) setCommandTimeout(timeout time.Duration) error {
 	}
 
 	// Check if session deadline has been exceeded
-	select {
-	case <-s.ctx.Done():
+	if deadline := s.sessionDeadlineTime(); !deadline.IsZero() && time.Now().After(deadline) {
 		s.Logger.Warn("Session deadline exceeded")
 		return ErrSessionTimeout
-	default:
-		// Set the command timeout
-		deadline := time.Now().Add(timeout)
-		if err := s.netConn.SetDeadline(deadline); err != nil {
-			s.Logger.Error("Failed to set deadline", "error", err)
-			return ErrInternalServerError
+	}
+
+	// Set the command timeout
+	if err := s.netConn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		s.Logger.Error("Failed to set deadline", "error", err)
+		return ErrInternalServerError
+	}
+	return nil
+}
+
+// sessionDeadlineTime returns the current session deadline, or the zero time
+// when the session has no budget (bare test sessions).
+func (s *Session) sessionDeadlineTime() time.Time {
+	nanos := s.sessionDeadline.Load()
+	if nanos == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, nanos)
+}
+
+// extendSessionDeadline restarts the session's progress budget. Called when a
+// transaction completes, so a sender delivering a queue of messages over one
+// connection is judged on progress rather than on total connection age.
+func (s *Session) extendSessionDeadline() {
+	if s.sessionDeadline.Load() == 0 {
+		return
+	}
+	s.sessionDeadline.Store(time.Now().Add(SessionDeadline).UnixNano())
+}
+
+// ensureSessionBudget guarantees at least d remains before the session
+// deadline. Without it, a transaction starting near the end of the budget would
+// be handed a truncated deadline — and a message rejected with 451 after the
+// backend had already accepted it is a duplicate on the next delivery attempt,
+// not a clean failure.
+func (s *Session) ensureSessionBudget(d time.Duration) {
+	for {
+		current := s.sessionDeadline.Load()
+		if current == 0 {
+			return
 		}
-		return nil
+		minimum := time.Now().Add(d).UnixNano()
+		if current >= minimum {
+			return
+		}
+		if s.sessionDeadline.CompareAndSwap(current, minimum) {
+			return
+		}
 	}
 }
 
 // commandContext derives the context for a command's outbound work from the
 // per-command context go-smtp supplies, bounded by the session deadline.
 // go-smtp cancels its context when the transaction ends or the server shuts
-// down; s.ctx carries SessionDeadline. Callers must call the returned cancel.
+// down; the session deadline stops work that outlives the session's budget.
+// Callers must call the returned cancel.
 func (s *Session) commandContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	if s.ctx != nil { // bare test sessions have no session context
-		if deadline, ok := s.ctx.Deadline(); ok {
-			return context.WithDeadline(ctx, deadline)
-		}
+	if deadline := s.sessionDeadlineTime(); !deadline.IsZero() {
+		return context.WithDeadline(ctx, deadline)
 	}
 	return context.WithCancel(ctx)
 }
@@ -1374,6 +1461,11 @@ func (s *Session) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) e
 // Data is called when the email body is received.
 // This is where we process the message headers and body, perform validation, and forward the email.
 func (s *Session) Data(ctx context.Context, r io.Reader) (err error) {
+	// Guarantee the full data budget before anything derives a context from the
+	// session deadline: reading the body and delivering it synchronously must
+	// not be cut short by however much of the session budget happens to remain.
+	s.ensureSessionBudget(DataPhaseBudget)
+
 	// 1. Perform initial checks and read the message data from the client.
 	rawEmail, err := s.readMessageData(r)
 	if err != nil {
@@ -1408,8 +1500,9 @@ func (s *Session) Data(ctx context.Context, r io.Reader) (err error) {
 
 // readMessageData handles the initial checks and reads the email content from the client.
 func (s *Session) readMessageData(r io.Reader) (string, error) {
-	// Set extended timeout for receiving potentially large email data.
-	if err := s.setCommandTimeout(DataTimeout); err != nil {
+	// Arm the first block's deadline (and check the session budget); the
+	// rolling reader below re-arms it as the body arrives.
+	if err := s.setCommandTimeout(DataBlockTimeout); err != nil {
 		return "", err
 	}
 
@@ -1436,11 +1529,16 @@ func (s *Session) readMessageData(r io.Reader) (string, error) {
 	// own 552; either path yields a rejection. go-smtp discards any remaining
 	// DATA after this returns.
 	maxSize := int64(s.serverConfig.MaxMessageSize)
+	// Bound how long the client may stall mid-message rather than how long the
+	// whole body may take: every chunk that arrives pushes the deadline out by
+	// DataBlockTimeout, so a slow uplink can keep sending while a client that
+	// goes silent is still dropped. The session deadline, guaranteed a full
+	// DataPhaseBudget by Data, is the ceiling the extensions cannot push past.
+	reader := newRollingDeadlineReader(r, s.netConn, DataBlockTimeout, s.sessionDeadlineTime())
 	// A non-positive limit means unlimited; only wrap with a bounded reader when
 	// a real limit is configured (otherwise LimitReader(r, 1) would truncate).
-	reader := io.Reader(r)
 	if maxSize > 0 {
-		reader = io.LimitReader(r, maxSize+1)
+		reader = io.LimitReader(reader, maxSize+1)
 	}
 	n, err := io.Copy(&s.mailData, reader)
 	if err != nil {
@@ -1944,6 +2042,12 @@ func (s *Session) finalizeSuccessfulDelivery() {
 			s.statsManager.RecordDeliveryRecipients(s.to, true)
 		}
 	}
+	// A completed transaction is the progress the session budget measures:
+	// restart it so a sender working through a queue on this connection is not
+	// disconnected mid-stream, which would force redelivery of every message it
+	// had not yet been told we accepted.
+	s.extendSessionDeadline()
+
 	s.Logger.Info("Email delivered successfully",
 		"from", s.from,
 		"to", s.to,

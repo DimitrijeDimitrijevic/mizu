@@ -321,6 +321,16 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Storage.S3Region != "us-east-1" {
 		t.Errorf("Storage.S3Region = %s; want us-east-1", cfg.Storage.S3Region)
 	}
+
+	// The command timeout becomes go-smtp's ReadTimeout, which is re-armed
+	// before every command read — it is the real "how long may a client pause"
+	// budget, including the pause before the first EHLO. RFC 5321 §4.5.3.2.7
+	// puts the floor at 5 minutes; below that, MUAs that stall between commands
+	// (e.g. a slow reverse-DNS lookup of their own LAN address) get a
+	// "421 4.4.2 Idle timeout" and report a broken connection.
+	if cfg.Defaults.TimeoutSeconds < 300 {
+		t.Errorf("Defaults.TimeoutSeconds = %d; want >= 300 (RFC 5321 §4.5.3.2.7)", cfg.Defaults.TimeoutSeconds)
+	}
 }
 
 func TestExpandEnvRefs(t *testing.T) {

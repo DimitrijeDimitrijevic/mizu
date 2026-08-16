@@ -4,7 +4,11 @@ local = false
 [defaults]
 hostname = "mail.example.com"
 max_message_size = 26214400
-timeout_seconds = 10
+# How long to wait for the next SMTP command. RFC 5321 §4.5.3.2.7 requires at
+# least 5 minutes; shorter values drop clients that pause between commands
+# (slow reverse-DNS before EHLO, laggy uplinks) with no real DoS benefit —
+# bound concurrency with max_connections / max_connections_per_ip instead.
+timeout_seconds = 300
 shutdown_timeout_seconds = 60
 max_connections = 100
 

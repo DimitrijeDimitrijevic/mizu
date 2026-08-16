@@ -85,9 +85,14 @@ func (s *Session) Auth(mech string) (sasl.Server, error) {
 			remoteIP = remoteIP[:idx]
 		}
 
+		// Rate-limiter work is bounded by the session budget: s.ctx carries only
+		// cancellation now that the deadline lives in sessionDeadline.
+		authCtx, cancelAuthCtx := s.commandContext(s.ctx)
+		defer cancelAuthCtx()
+
 		// Check auth rate limit before attempting authentication
 		if s.authRateLimiter != nil {
-			if err := s.authRateLimiter.CanAttemptAuth(s.ctx, remoteIP, user); err != nil {
+			if err := s.authRateLimiter.CanAttemptAuth(authCtx, remoteIP, user); err != nil {
 				s.Logger.Warn("Authentication blocked by rate limiter",
 					"username", user,
 					"ip", remoteIP,
@@ -103,7 +108,7 @@ func (s *Session) Auth(mech string) (sasl.Server, error) {
 					"ip", remoteIP,
 					"delay", delay)
 				select {
-				case <-s.ctx.Done():
+				case <-authCtx.Done():
 					return fmt.Errorf("authentication cancelled")
 				case <-time.After(delay):
 					// Delay complete, continue
@@ -124,7 +129,7 @@ func (s *Session) Auth(mech string) (sasl.Server, error) {
 		// backend error is neither a success nor a failed guess; counting it
 		// would spend a legitimate user's attempt budget on OUR outage.
 		if s.authRateLimiter != nil && err == nil {
-			s.authRateLimiter.RecordAuthAttempt(s.ctx, remoteIP, user, authenticated)
+			s.authRateLimiter.RecordAuthAttempt(authCtx, remoteIP, user, authenticated)
 		}
 
 		// ERROR IS CHECKED FIRST, and the order is the safety property. The

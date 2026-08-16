@@ -25,7 +25,7 @@ type Config struct {
 type DefaultsConfig struct {
 	Hostname               string `toml:"hostname"`                 // Default hostname (FQDN) for all servers
 	MaxMessageSize         int    `toml:"max_message_size"`         // Default max message size in bytes
-	TimeoutSeconds         int    `toml:"timeout_seconds"`          // Default SMTP command timeout
+	TimeoutSeconds         int    `toml:"timeout_seconds"`          // Default SMTP command timeout (see ServerConfig.TimeoutSeconds)
 	ShutdownTimeoutSeconds int    `toml:"shutdown_timeout_seconds"` // Default graceful shutdown timeout
 	MaxConnections         int    `toml:"max_connections"`          // Default max total connections per server
 }
@@ -60,6 +60,20 @@ type ServerConfig struct {
 	TLS ServerTLSConfig `toml:"tls"` // TLS configuration (if section present, TLS is enabled)
 
 	// === Timeouts ===
+	// TimeoutSeconds is how long the server waits for the next command from
+	// the client (and for a response write to drain). RFC 5321 §4.5.3.2.7
+	// sets the floor at 5 minutes, which is also Postfix's smtpd_timeout
+	// default; anything shorter disconnects legitimate clients that pause
+	// between commands — a desktop MUA doing a slow reverse-DNS lookup of its
+	// own LAN address before EHLO, a laggy mobile uplink, an on-access virus
+	// scanner. Such a client sees the connection drop right after the banner
+	// or mid-conversation and cannot distinguish it from a network fault.
+	//
+	// A short value buys almost no DoS protection: an attacker holding a slot
+	// only has to trickle one command per interval to stay under it, and total
+	// connection lifetime is bounded independently by smtp.SessionDeadline.
+	// Cap concurrency with limits.max_connections / max_connections_per_ip
+	// instead.
 	TimeoutSeconds         int `toml:"timeout_seconds"`          // SMTP command timeout (overrides default)
 	ShutdownTimeoutSeconds int `toml:"shutdown_timeout_seconds"` // Graceful shutdown timeout (overrides default)
 
@@ -613,7 +627,7 @@ func DefaultConfig() Config {
 		Defaults: DefaultsConfig{
 			Hostname:               "mail.example.com",
 			MaxMessageSize:         25 * 1024 * 1024, // 25MB
-			TimeoutSeconds:         10,
+			TimeoutSeconds:         300,              // RFC 5321 §4.5.3.2.7 server minimum
 			ShutdownTimeoutSeconds: 60,
 			MaxConnections:         100,
 		},

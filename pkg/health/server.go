@@ -310,9 +310,9 @@ func (s *Server) Start() {
 	}
 
 	s.httpServer = &http.Server{
-		Addr:      s.listenAddr,
-		Handler:   s.mux,
-		ErrorLog:  logging.NewHTTPErrorLogger(s.logger, "health", s.listenAddr),
+		Addr:     s.listenAddr,
+		Handler:  s.mux,
+		ErrorLog: logging.NewHTTPErrorLogger(s.logger, "health", s.listenAddr),
 		// Timeouts prevent slowloris-style connection exhaustion. WriteTimeout
 		// must exceed the 8s health-check collection deadline in healthHandler
 		// (it is set as a connection deadline when a request starts and covers
