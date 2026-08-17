@@ -827,12 +827,19 @@ func (s *Server) unblockIPHandler(w http.ResponseWriter, r *http.Request) {
 			ip = body.IP
 		}
 	}
-	if ip == "" || net.ParseIP(ip) == nil {
+	// A plain address unblocks that IP; CIDR notation (e.g. "203.0.113.0/24")
+	// lifts a subnet block from the auth rate limiter.
+	valid := net.ParseIP(ip) != nil
+	if !valid && strings.Contains(ip, "/") {
+		_, _, err := net.ParseCIDR(ip)
+		valid = err == nil
+	}
+	if !valid {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]any{
 			"status": "error",
-			"error":  "valid ip parameter is required",
+			"error":  "valid ip or CIDR parameter is required",
 		})
 		return
 	}

@@ -89,6 +89,12 @@ Key packages:
    - 5-minute authentication cache to reduce API calls
    - Validates that authenticated users can only send from authorized addresses
    - Adds `X-Auth-User` header to delivery for authenticated messages
+   - `AuthRateLimiter` ([pkg/smtp/auth_rate_limiter.go](pkg/smtp/auth_rate_limiter.go)) blocks brute force in three tiers, configured under `[server.auth.rate_limit]`:
+     - Tier 1 (IP+username), Tier 2 (IP-only), Tier 3 (subnet, [pkg/smtp/auth_subnet.go](pkg/smtp/auth_subnet.go))
+     - Tier 3 catches attackers rotating through sibling IPs, which never accumulate under tiers 1-2. It triggers on **breadth** (distinct failing addresses in a subnet: `subnet_max_distinct_ips`, default 8), not volume, so a shared NAT does not qualify. IPv4 groups by /24, IPv6 counts distinct /64s inside a /48
+     - Every tier keys IPv6 by /64 (`bucketIP`), otherwise one allocation supplies 2^64 free identities
+     - Refusals are 454 (temporary), an address that logged in successfully within `success_exempt_duration` (default 24h) bypasses subnet blocks, and private/loopback/`subnet_exempt` ranges are never blocked
+     - Lift a subnet block with `./mizu-admin unblock-ip 203.0.113.0/24` (CIDR form); blocks and unblocks propagate over cluster gossip
 
 4. **Connection Tracking & DoS Protection** ([pkg/smtp/](pkg/smtp/))
    - `ConnectionTracker`: Local per-IP and global connection limits

@@ -198,6 +198,22 @@ type ServerAuthRateLimitConfig struct {
 	IPBlockDuration  string `toml:"ip_block_duration"`   // Block duration (default: "30m")
 	IPWindowDuration string `toml:"ip_window_duration"`  // Sliding window for counting failures (default: "30m")
 
+	// TIER 3: Subnet Blocking
+	// Catches attackers rotating through sibling IPs (one failure per address,
+	// so tiers 1-2 never accumulate). Triggers on BREADTH — distinct failing
+	// IPs inside one subnet — not raw failure volume, so a shared NAT where a
+	// few users mistype passwords never qualifies. IPv4 groups by /24; IPv6
+	// counts distinct /64s inside a /48 (a /64 is one subscriber, so
+	// per-address counting would hand v6 attackers 2^64 free identities).
+	SubnetMaxDistinctIPs  int      `toml:"subnet_max_distinct_ips"` // Distinct failing IPv4 addresses / IPv6 64s before the subnet blocks (default: 8, negative = tier disabled)
+	SubnetMinFailures     int      `toml:"subnet_min_failures"`     // Minimum total failures in the window before the subnet blocks (default: 15)
+	SubnetWindowDuration  string   `toml:"subnet_window_duration"`  // Sliding window for the distinct-IP set (default: "30m")
+	SubnetBlockDuration   string   `toml:"subnet_block_duration"`   // Block duration (default: "30m")
+	SubnetIPv4Prefix      int      `toml:"subnet_ipv4_prefix"`      // IPv4 grouping prefix length (default: 24)
+	SubnetIPv6Prefix      int      `toml:"subnet_ipv6_prefix"`      // IPv6 grouping prefix length (default: 48)
+	SubnetExempt          []string `toml:"subnet_exempt"`           // CIDRs never subnet-blocked (own infra, known customers); private/loopback are always exempt
+	SuccessExemptDuration string   `toml:"success_exempt_duration"` // How long a successful login exempts its IP from subnet blocks (default: "24h")
+
 	// USERNAME TRACKING (Statistics Only - No Blocking)
 	// Synchronized across cluster for detecting compromised accounts
 	MaxAttemptsPerUsername int    `toml:"max_attempts_per_username"` // Tracking threshold (default: 100, no blocking)
@@ -218,6 +234,7 @@ type ServerAuthRateLimitConfig struct {
 	MaxIPUsernameEntries int `toml:"max_ip_username_entries"` // Max IP+username tracking entries (default: 100000, 0 = unlimited)
 	MaxIPEntries         int `toml:"max_ip_entries"`          // Max IP tracking entries (default: 50000, 0 = unlimited)
 	MaxUsernameEntries   int `toml:"max_username_entries"`    // Max username tracking entries (default: 50000, 0 = unlimited)
+	MaxSubnetEntries     int `toml:"max_subnet_entries"`      // Max subnet tracking entries (default: 10000, 0 = unlimited)
 
 	// CLUSTER SYNCHRONIZATION
 	// Syncs auth failures and blocks across cluster via gossip

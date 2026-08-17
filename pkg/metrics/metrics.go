@@ -64,6 +64,7 @@ type Metrics struct {
 	// Auth rate limiter metrics
 	AuthRateLimitIPBlocks         *prometheus.CounterVec   // Labels: ip
 	AuthRateLimitIPUsernameBlocks *prometheus.CounterVec   // Labels: ip, username
+	AuthRateLimitSubnetBlocks     *prometheus.CounterVec   // Labels: subnet
 	AuthRateLimitDelays           *prometheus.HistogramVec // Labels: type (ip, ip_username)
 	AuthRateLimitEvictions        *prometheus.CounterVec   // Labels: type (ip, ip_username, username, blocked_ips)
 	AuthRateLimitCacheSize        *prometheus.GaugeVec     // Labels: type
@@ -338,6 +339,12 @@ func New(namespace string) *Metrics {
 			Name:      "ip_username_blocks_total",
 			Help:      "Total number of IP+username combinations blocked",
 		}, []string{"ip", "username"}),
+		AuthRateLimitSubnetBlocks: promauto.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: "auth_rate_limit",
+			Name:      "subnet_blocks_total",
+			Help:      "Total number of subnets blocked due to distributed authentication failures",
+		}, []string{"subnet"}),
 		AuthRateLimitDelays: promauto.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Subsystem: "auth_rate_limit",

@@ -1032,6 +1032,22 @@ func createServerBackend(
 		if cfg.MaxUsernameEntries == 0 {
 			cfg.MaxUsernameEntries = 50000
 		}
+		if cfg.MaxSubnetEntries == 0 {
+			cfg.MaxSubnetEntries = 10000
+		}
+		// Tier 3 subnet blocking: on by default (0 = unset; negative disables).
+		if cfg.SubnetMaxDistinctIPs == 0 {
+			cfg.SubnetMaxDistinctIPs = 8
+		}
+		if cfg.SubnetMinFailures == 0 {
+			cfg.SubnetMinFailures = 15
+		}
+		if cfg.SubnetIPv4Prefix == 0 {
+			cfg.SubnetIPv4Prefix = 24
+		}
+		if cfg.SubnetIPv6Prefix == 0 {
+			cfg.SubnetIPv6Prefix = 48
+		}
 
 		// Enable auth rate limiting by default when auth is required
 		if !cfg.Enabled && serverCfg.Auth.Required {
@@ -1061,6 +1077,7 @@ func createServerBackend(
 				"max_ip_username", cfg.MaxAttemptsPerIPUsername,
 				"max_ip", cfg.MaxAttemptsPerIP,
 				"max_username", cfg.MaxAttemptsPerUsername,
+				"subnet_distinct_ips", cfg.SubnetMaxDistinctIPs,
 				"cluster_sync", cfg.ClusterSyncEnabled)
 		}
 	}

@@ -132,7 +132,7 @@ Commands:
   tls                Manage TLS certificates (list, delete, clean, sync)
   renew-cert         Force certificate renewal for a domain
   flush-cache        Flush recipient and IP block caches
-  unblock-ip         Remove a specific IP from the reputation tracker
+  unblock-ip         Remove an IP (or, in CIDR form, a blocked subnet) from tracking
   auth               Check a username/password against the SMTP AUTH backend
   version            Show version information
 
@@ -778,12 +778,16 @@ func cmdFlushCache() {
 
 func cmdUnblockIP() {
 	if flag.NArg() < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: mizu-admin unblock-ip <ip-address>\n")
+		fmt.Fprintf(os.Stderr, "Usage: mizu-admin unblock-ip <ip-address|cidr>\n")
 		os.Exit(1)
 	}
 	ip := flag.Arg(1)
+	// CIDR notation lifts a subnet block from the auth rate limiter; a plain
+	// address unblocks that address.
 	if net.ParseIP(ip) == nil {
-		fatal("Invalid IP address: %s", ip)
+		if _, _, err := net.ParseCIDR(ip); err != nil {
+			fatal("Invalid IP address or CIDR: %s", ip)
+		}
 	}
 
 	bodyJSON, _ := json.Marshal(map[string]string{"ip": ip})
