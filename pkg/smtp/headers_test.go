@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"migadu/mizu/pkg/config"
 	"migadu/mizu/pkg/validation"
 
 	"github.com/emersion/go-msgauth/authres"
@@ -54,8 +55,8 @@ func TestInjectMizuHeaders(t *testing.T) {
 		dmarcResult,
 		arcResult,
 		false, // not junk
-		false, // don't disable mizu headers
-		nil,   // no spam headers
+		config.HeaderToggles{TraceID: true, AuthResults: true, Junk: true},
+		nil, // no spam headers
 	)
 
 	// Verify the modified email contains expected headers
@@ -108,12 +109,12 @@ func TestInjectMizuHeaders_Junk(t *testing.T) {
 		"spammer.bad.com",
 		"trace123",
 		"TLS 1.2",
-		nil,   // no SPF
-		nil,   // no DMARC
-		nil,   // no ARC
-		true,  // IS JUNK
-		false, // don't disable mizu headers
-		nil,   // no spam headers
+		nil,  // no SPF
+		nil,  // no DMARC
+		nil,  // no ARC
+		true, // IS JUNK
+		config.HeaderToggles{TraceID: true, AuthResults: true, Junk: true},
+		nil, // no spam headers
 	)
 
 	// Should mark as junk
@@ -144,8 +145,8 @@ func TestInjectMizuHeaders_NoTLS(t *testing.T) {
 		nil,
 		nil,
 		false,
-		false, // don't disable mizu headers
-		nil,   // no spam headers
+		config.HeaderToggles{TraceID: true, AuthResults: true, Junk: true},
+		nil, // no spam headers
 	)
 
 	// Should use ESMTP (not ESMTPS) when no TLS
@@ -154,6 +155,70 @@ func TestInjectMizuHeaders_NoTLS(t *testing.T) {
 	}
 	if strings.Contains(modifiedEmail, "ESMTPS") {
 		t.Error("Should not contain ESMTPS when TLS is not used")
+	}
+}
+
+func TestInjectMizuHeaders_ToggleSuppression(t *testing.T) {
+	originalEmail := "From: sender@example.com\r\nSubject: Test\r\n\r\nBody\r\n"
+
+	// Each case disables exactly one header; the other two must survive so a
+	// toggle routed to the wrong header block is caught, not just an
+	// all-on/all-off regression.
+	cases := []struct {
+		name    string
+		toggles config.HeaderToggles
+		absent  string
+		present []string
+	}{
+		{
+			name:    "trace ID off",
+			toggles: config.HeaderToggles{AuthResults: true, Junk: true},
+			absent:  "X-Mizu-Trace-ID:",
+			present: []string{"X-Mizu-Authentication-Results:", "X-Mizu-Junk:"},
+		},
+		{
+			name:    "auth results off",
+			toggles: config.HeaderToggles{TraceID: true, Junk: true},
+			absent:  "X-Mizu-Authentication-Results:",
+			present: []string{"X-Mizu-Trace-ID:", "X-Mizu-Junk:"},
+		},
+		{
+			name:    "junk off",
+			toggles: config.HeaderToggles{TraceID: true, AuthResults: true},
+			absent:  "X-Mizu-Junk:",
+			present: []string{"X-Mizu-Trace-ID:", "X-Mizu-Authentication-Results:"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			modifiedEmail := InjectMizuHeaders(
+				originalEmail,
+				"mail.example.com",
+				"1.2.3.4:5678",
+				"client.example.com",
+				"trace123",
+				"TLS 1.3",
+				nil, nil, nil,
+				false,
+				tc.toggles,
+				nil,
+			)
+
+			if strings.Contains(modifiedEmail, tc.absent) {
+				t.Errorf("Expected %q suppressed, got:\n%s", tc.absent, modifiedEmail)
+			}
+			for _, want := range tc.present {
+				if !strings.Contains(modifiedEmail, want) {
+					t.Errorf("Expected %q present, got:\n%s", want, modifiedEmail)
+				}
+			}
+			// The Received header (with the trace ID as its id token) is
+			// emitted regardless of the toggles.
+			if !strings.Contains(modifiedEmail, "Received: from") || !strings.Contains(modifiedEmail, "id trace123") {
+				t.Errorf("Received header must be present regardless of toggles, got:\n%s", modifiedEmail)
+			}
+		})
 	}
 }
 
@@ -177,7 +242,7 @@ func TestInjectMizuHeaders_SpamHeaderSanitization(t *testing.T) {
 		"TLS 1.3",
 		nil, nil, nil,
 		false,
-		true, // disable mizu headers — focus the assertion on the spam path
+		config.HeaderToggles{}, // no X-Mizu-* headers — focus the assertion on the spam path
 		spamHeaders,
 	)
 
@@ -218,7 +283,7 @@ func TestInjectMizuHeaders_FoldedSpamHeaderPreserved(t *testing.T) {
 		"TLS 1.3",
 		nil, nil, nil,
 		false,
-		true, // disable mizu headers — focus on the spam path
+		config.HeaderToggles{}, // no X-Mizu-* headers — focus on the spam path
 		spamHeaders,
 	)
 

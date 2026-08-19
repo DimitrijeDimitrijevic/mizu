@@ -158,6 +158,21 @@ Key packages:
   - **"none"**: Allow through without modification
 - `allow_null_sender`: Allow bounce messages with null sender `<>` (typically false for submission, true for relay)
 
+**Injected Headers Configuration:**
+- Per-server `[[server]]` toggles for the X-Mizu-* headers added before
+  delivery (each defaults to true; the `Received` header — which carries the
+  trace ID as its `id` token — is always added regardless):
+  - `enable_trace_id_header`: `X-Mizu-Trace-ID`
+  - `enable_auth_results_header`: `X-Mizu-Authentication-Results` — mailqueuer
+    parses this header at ingest for the ledger's auth verdicts; disabling it
+    means empty verdicts on `ingested` rows
+  - `enable_junk_header`: `X-Mizu-Junk` — governs only this header;
+    `junk.apply_action` adds its own marker (e.g. `X-Spam`) independently, and
+    rspamd's forwarded `add_headers` (X-Migadu-*) bypass these toggles entirely
+- Replaced the former all-or-nothing `disable_mizu_headers` (forward-only, no
+  fallback). Unknown/stale config keys produce a startup stderr warning
+  (`warnUndecodedKeys` in [pkg/config/loader.go](pkg/config/loader.go))
+
 **Authentication Configuration (for submission servers):**
 - `[server.auth]` section configures SMTP AUTH for ports 587/465
 - `enabled`: Enable SMTP AUTH (advertise AUTH in EHLO response)

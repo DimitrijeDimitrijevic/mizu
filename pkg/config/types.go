@@ -92,8 +92,15 @@ type ServerConfig struct {
 	AdvertiseLimits bool `toml:"advertise_limits"`
 
 	// === Debugging ===
-	Debug              bool `toml:"debug"`                // Enable SMTP protocol debug logging (shows all SMTP commands and responses)
-	DisableMizuHeaders bool `toml:"disable_mizu_headers"` // Disable X-Mizu-* headers (keeps Received header, removes X-Mizu-Trace-ID, X-Mizu-Authentication-Results, X-Mizu-Junk)
+	Debug bool `toml:"debug"` // Enable SMTP protocol debug logging (shows all SMTP commands and responses)
+
+	// === Injected Header Toggles ===
+	// Per-header toggles for the X-Mizu-* headers injected before delivery.
+	// nil defaults to true (header emitted); explicit false suppresses the
+	// individual header. The Received header is always added regardless.
+	EnableTraceIDHeader     *bool `toml:"enable_trace_id_header"`     // X-Mizu-Trace-ID (default: true)
+	EnableAuthResultsHeader *bool `toml:"enable_auth_results_header"` // X-Mizu-Authentication-Results (default: true)
+	EnableJunkHeader        *bool `toml:"enable_junk_header"`         // X-Mizu-Junk (default: true). Governs only this header: junk.apply_action adds its own junk marker (e.g. X-Spam) independently
 
 	// === Email Validation ===
 	HELOValidation        *bool  `toml:"helo_validation"`         // Validate HELO/EHLO hostname (default: true on relay, false on submission — Windows MUAs send bare machine names; explicit setting wins)
@@ -124,6 +131,22 @@ type ServerConfig struct {
 
 	// === Delivery Configuration (per-server) ===
 	Delivery DeliveryConfig `toml:"delivery"` // HTTP endpoint for email delivery
+}
+
+// HeaderToggles selects which X-Mizu-* headers are injected before delivery.
+type HeaderToggles struct {
+	TraceID     bool // X-Mizu-Trace-ID
+	AuthResults bool // X-Mizu-Authentication-Results
+	Junk        bool // X-Mizu-Junk
+}
+
+// HeaderToggles resolves the per-header enable flags (nil = true).
+func (s *ServerConfig) HeaderToggles() HeaderToggles {
+	return HeaderToggles{
+		TraceID:     s.EnableTraceIDHeader == nil || *s.EnableTraceIDHeader,
+		AuthResults: s.EnableAuthResultsHeader == nil || *s.EnableAuthResultsHeader,
+		Junk:        s.EnableJunkHeader == nil || *s.EnableJunkHeader,
+	}
 }
 
 // ServerLimitsConfig holds connection limits
@@ -406,6 +429,14 @@ func (s *ServerConfig) ApplyDefaults(defaults DefaultsConfig) {
 	if s.LegacyAuthCap == nil {
 		trueVal := true
 		s.LegacyAuthCap = &trueVal
+	}
+
+	// X-Mizu-* header toggles default to true (pointers detect unset)
+	for _, p := range []**bool{&s.EnableTraceIDHeader, &s.EnableAuthResultsHeader, &s.EnableJunkHeader} {
+		if *p == nil {
+			trueVal := true
+			*p = &trueVal
+		}
 	}
 
 	// Apply validation defaults

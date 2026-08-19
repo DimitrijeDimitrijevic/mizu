@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"migadu/mizu/pkg/config"
 	"migadu/mizu/pkg/validation"
 )
 
@@ -23,18 +24,16 @@ func normalizeToCRLF(s string) string {
 
 // InjectMizuHeaders adds Received and X-Mizu-* headers to the email
 // These headers provide email tracing, authentication results, and debugging information
-// If disableMizuHeaders is true, only the Received header is added (X-Mizu-* headers are skipped)
+// toggles selects which X-Mizu-* headers are emitted; the Received header is always added
 // spamHeaders contains additional headers from spam checking (e.g., X-Junk: yes); a key
 // may map to multiple values, which become separate header lines (e.g. Authentication-Results).
-func InjectMizuHeaders(rawEmail, domain, remoteAddr, heloHostname, traceID string, tlsVersion string, spfResult *validation.SPFResult, dmarcResult *validation.DMARCResult, arcResult *validation.ARCResult, isJunk bool, disableMizuHeaders bool, spamHeaders map[string][]string) string {
+// spamHeaders are NOT subject to toggles — rspamd's add_headers are injected verbatim.
+func InjectMizuHeaders(rawEmail, domain, remoteAddr, heloHostname, traceID string, tlsVersion string, spfResult *validation.SPFResult, dmarcResult *validation.DMARCResult, arcResult *validation.ARCResult, isJunk bool, toggles config.HeaderToggles, spamHeaders map[string][]string) string {
 	// Build the Received header (always added)
 	receivedHeader := buildReceivedHeader(domain, remoteAddr, heloHostname, traceID, tlsVersion)
 
-	// Build X-Mizu-* headers (only if not disabled)
-	var mizuHeaders string
-	if !disableMizuHeaders {
-		mizuHeaders = buildMizuHeaders(traceID, spfResult, dmarcResult, arcResult, isJunk)
-	}
+	// Build X-Mizu-* headers (per-header toggles)
+	mizuHeaders := buildMizuHeaders(traceID, spfResult, dmarcResult, arcResult, isJunk, toggles)
 
 	// Build spam check headers (from rspamd or other spam checkers).
 	// Sanitize both name and value: although rspamd is internal, a stray CR/LF
@@ -150,24 +149,30 @@ func sanitizeFoldedHeaderValue(s string) string {
 }
 
 // buildMizuHeaders creates custom X-Mizu-* headers for debugging and analysis
-func buildMizuHeaders(traceID string, spfResult *validation.SPFResult, dmarcResult *validation.DMARCResult, arcResult *validation.ARCResult, isJunk bool) string {
+func buildMizuHeaders(traceID string, spfResult *validation.SPFResult, dmarcResult *validation.DMARCResult, arcResult *validation.ARCResult, isJunk bool, toggles config.HeaderToggles) string {
 	var sb strings.Builder
 
 	// X-Mizu-Trace-ID: Unique identifier for this email transaction
-	sb.WriteString("X-Mizu-Trace-ID: ")
-	sb.WriteString(traceID)
-	sb.WriteString("\r\n")
+	if toggles.TraceID {
+		sb.WriteString("X-Mizu-Trace-ID: ")
+		sb.WriteString(traceID)
+		sb.WriteString("\r\n")
+	}
 
 	// X-Mizu-Authentication-Results: Summary of authentication results
-	sb.WriteString("X-Mizu-Authentication-Results: ")
-	sb.WriteString(buildAuthenticationSummary(spfResult, dmarcResult, arcResult))
-	sb.WriteString("\r\n")
+	if toggles.AuthResults {
+		sb.WriteString("X-Mizu-Authentication-Results: ")
+		sb.WriteString(buildAuthenticationSummary(spfResult, dmarcResult, arcResult))
+		sb.WriteString("\r\n")
+	}
 
 	// X-Mizu-Junk: Spam classification
-	if isJunk {
-		sb.WriteString("X-Mizu-Junk: YES\r\n")
-	} else {
-		sb.WriteString("X-Mizu-Junk: NO\r\n")
+	if toggles.Junk {
+		if isJunk {
+			sb.WriteString("X-Mizu-Junk: YES\r\n")
+		} else {
+			sb.WriteString("X-Mizu-Junk: NO\r\n")
+		}
 	}
 
 	return sb.String()
