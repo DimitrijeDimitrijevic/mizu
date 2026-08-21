@@ -3,104 +3,66 @@ package smtp
 import (
 	"io"
 	"log/slog"
+	"net"
 	"testing"
 
 	"migadu/mizu/pkg/config"
 )
 
-func TestMatchIPWhitelist(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	backend := &Backend{
-		ServerConfig: &config.ServerConfig{Name: "test"},
-		Logger:       logger,
-	}
-
+func TestIPInNets(t *testing.T) {
 	tests := []struct {
-		name           string
-		ip             string
-		whitelistEntry string
-		expected       bool
+		name     string
+		ip       string
+		entries  []string
+		expected bool
 	}{
-		// Exact IP matches
 		{
-			name:           "exact IPv4 match",
-			ip:             "1.2.3.4",
-			whitelistEntry: "1.2.3.4",
-			expected:       true,
+			name:     "empty whitelist",
+			ip:       "1.2.3.4",
+			entries:  nil,
+			expected: false,
 		},
 		{
-			name:           "exact IPv4 no match",
-			ip:             "1.2.3.4",
-			whitelistEntry: "1.2.3.5",
-			expected:       false,
+			name:     "exact IP in list",
+			ip:       "1.2.3.4",
+			entries:  []string{"5.6.7.8", "1.2.3.4"},
+			expected: true,
 		},
 		{
-			name:           "exact IPv6 match",
-			ip:             "2001:db8::1",
-			whitelistEntry: "2001:db8::1",
-			expected:       true,
-		},
-
-		// CIDR matches
-		{
-			name:           "IPv4 CIDR match /24",
-			ip:             "10.0.1.50",
-			whitelistEntry: "10.0.1.0/24",
-			expected:       true,
+			name:     "CIDR in list",
+			ip:       "10.0.1.50",
+			entries:  []string{"192.168.0.0/16", "10.0.0.0/8"},
+			expected: true,
 		},
 		{
-			name:           "IPv4 CIDR no match /24",
-			ip:             "10.0.2.50",
-			whitelistEntry: "10.0.1.0/24",
-			expected:       false,
+			name:     "no match",
+			ip:       "1.2.3.4",
+			entries:  []string{"5.6.7.8", "10.0.0.0/8"},
+			expected: false,
 		},
 		{
-			name:           "IPv4 CIDR match /8",
-			ip:             "10.50.100.200",
-			whitelistEntry: "10.0.0.0/8",
-			expected:       true,
+			name:     "exact IPv6 in list",
+			ip:       "2001:db8::1",
+			entries:  []string{"2001:db8::1"},
+			expected: true,
 		},
 		{
-			name:           "IPv6 CIDR match",
-			ip:             "2001:db8::1234",
-			whitelistEntry: "2001:db8::/32",
-			expected:       true,
-		},
-
-		// Edge cases
-		{
-			name:           "invalid IP",
-			ip:             "not-an-ip",
-			whitelistEntry: "1.2.3.4",
-			expected:       false,
-		},
-		{
-			name:           "invalid CIDR",
-			ip:             "1.2.3.4",
-			whitelistEntry: "1.2.3.4/99",
-			expected:       false,
-		},
-		{
-			name:           "invalid whitelist IP",
-			ip:             "1.2.3.4",
-			whitelistEntry: "not-an-ip",
-			expected:       false,
-		},
-
-		// Real-world monitoring service examples
-		{
-			name:           "Hetrix Tools IP",
-			ip:             "189.1.173.35",
-			whitelistEntry: "189.1.173.35",
-			expected:       true,
+			name:     "IPv6 CIDR in list",
+			ip:       "2001:db8::1234",
+			entries:  []string{"2001:db8::/32"},
+			expected: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := backend.matchIPWhitelist(tt.ip, tt.whitelistEntry)
+			nets, err := config.ParseIPList(tt.entries)
+			if err != nil {
+				t.Fatalf("ParseIPList(%v) failed: %v", tt.entries, err)
+			}
+			result := ipInNets(net.ParseIP(tt.ip), nets)
 			if result != tt.expected {
-				t.Errorf("matchIPWhitelist(%q, %q) = %v, want %v", tt.ip, tt.whitelistEntry, result, tt.expected)
+				t.Errorf("ipInNets(%q, %v) = %v, want %v", tt.ip, tt.entries, result, tt.expected)
 			}
 		})
 	}

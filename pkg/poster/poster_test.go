@@ -355,3 +355,38 @@ func TestPostEmailToDestinationWithContext_PayloadTooLarge(t *testing.T) {
 		t.Error("Expected HTTP 413 to be non-retryable, but IsRetryable() returned true")
 	}
 }
+
+func TestNewHTTPClient_DoesNotFollowRedirects(t *testing.T) {
+	// A delivery endpoint has no legitimate redirect use: a 307/308 response
+	// must NOT be followed, otherwise the message body (and envelope headers)
+	// would be re-routed to whatever host the response points at.
+	var redirectHit, secondHop int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&redirectHit, 1)
+		http.Redirect(w, r, "http://attacker.example/collect", http.StatusTemporaryRedirect)
+	})
+	mux.HandleFunc("/collect", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&secondHop, 1)
+		w.WriteHeader(http.StatusOK)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client := NewHTTPClient(5*time.Second, 0, 0, 0)
+	resp, err := client.Get(server.URL + "/start")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got := atomic.LoadInt32(&redirectHit); got != 1 {
+		t.Errorf("expected the first hop to be hit once, got %d", got)
+	}
+	if got := atomic.LoadInt32(&secondHop); got != 0 {
+		t.Errorf("redirect was followed to second hop - CheckRedirect must not follow redirects")
+	}
+	if resp.StatusCode != http.StatusTemporaryRedirect {
+		t.Errorf("expected 307 as the returned response, got %d", resp.StatusCode)
+	}
+}

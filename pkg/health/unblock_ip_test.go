@@ -116,8 +116,45 @@ func TestUnblockIPHandler_EmptyBody(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d", w.Code)
 	}
-	if !strings.Contains(w.Body.String(), "valid ip parameter is required") {
-		t.Errorf("expected 'valid ip parameter is required', got %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), "valid ip or CIDR parameter is required") {
+		t.Errorf("expected 'valid ip or CIDR parameter is required', got %s", w.Body.String())
+	}
+}
+
+// TestUnblockIPHandler_CIDR: CIDR notation is accepted and passed through to
+// the unblocker (which lifts a subnet block in the auth rate limiter).
+func TestUnblockIPHandler_CIDR(t *testing.T) {
+	s := NewServer(":0", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s.SetHealthEnabled(true)
+	ub := &mockUnblocker{removed: true}
+	s.SetIPUnblocker(ub)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/unblock-ip?ip=203.0.113.0/24", nil)
+	w := httptest.NewRecorder()
+
+	s.unblockIPHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if ub.lastIP != "203.0.113.0/24" {
+		t.Errorf("expected CIDR passed through to unblocker, got %q", ub.lastIP)
+	}
+}
+
+// TestUnblockIPHandler_BadCIDR: garbage with a slash is still refused.
+func TestUnblockIPHandler_BadCIDR(t *testing.T) {
+	s := NewServer(":0", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s.SetHealthEnabled(true)
+	s.SetIPUnblocker(&mockUnblocker{})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/unblock-ip?ip=garbage/24", nil)
+	w := httptest.NewRecorder()
+
+	s.unblockIPHandler(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", w.Code)
 	}
 }
 

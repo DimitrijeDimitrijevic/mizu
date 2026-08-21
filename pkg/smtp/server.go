@@ -32,12 +32,50 @@ import (
 	"github.com/emersion/go-smtp"
 )
 
+// Session timeouts, in the order they bind.
+//
+// The wait for the next command belongs to go-smtp, not to this package:
+// Server.ReadTimeout (config timeout_seconds, RFC 5321 §4.5.3.2.7 requires at
+// least 5 minutes) is re-armed before every command read and therefore
+// overrides whatever deadline a session callback left on the socket. The
+// deadlines below are what remains ours: the DATA body, which go-smtp hands to
+// Session.Data without touching the deadline, and a backstop for deployments
+// that disable go-smtp's timeouts by setting timeout_seconds to 0.
 const (
-	// Session timeouts for security and resource management
-	SessionDeadline   = 5 * time.Minute  // Hard limit for entire SMTP session to prevent hanging connections
-	ProcessingTimeout = 30 * time.Second // Timeout for processing a command after it's received
-	IdleTimeout       = 1 * time.Minute  // Maximum idle time between commands before disconnect
-	DataTimeout       = 2 * time.Minute  // Timeout for receiving email body after DATA command
+	// SessionDeadline caps time spent without completing a transaction, and is
+	// restarted by extendSessionDeadline whenever one completes — a sender
+	// working through a queue on one connection is judged on progress, not on
+	// total connection age. It bounds a client that drips valid commands
+	// forever; a client that simply goes quiet is cut off far sooner by the
+	// per-phase budgets below.
+	SessionDeadline = 30 * time.Minute
+
+	// DataPhaseBudget is what ensureSessionBudget reserves when DATA starts, so
+	// receiving the body and delivering it synchronously is never handed
+	// whatever scrap of the session budget happens to remain. RFC 5321
+	// §4.5.3.2.6 allows 10 minutes for the reply to the end of a DATA transfer
+	// precisely so this work can finish before the sender gives up. It is also
+	// the ceiling on the body read: the rolling deadline below may not push
+	// past the session deadline, or a client dripping one byte at a time could
+	// hold the phase open forever.
+	DataPhaseBudget = 10 * time.Minute
+
+	// DataBlockTimeout bounds how long the client may stall *within* the
+	// message body. It is re-armed on every chunk that arrives (see
+	// rollingDeadlineReader), per RFC 5321 §4.5.3.2.6, which specifies a
+	// per-block rather than a whole-transfer budget. A single deadline over
+	// the entire body would silently turn max_message_size into a minimum
+	// bandwidth requirement (25MB in 2 minutes ≈ 1.7 Mbit/s) and cut off
+	// mobile and other slow uplinks mid-message.
+	DataBlockTimeout = 3 * time.Minute
+
+	// ProcessingTimeout is the socket deadline held while a command handler
+	// runs, and IdleTimeout the one left behind for the wait that follows.
+	// Both are normally superseded by go-smtp's own deadlines; they matter
+	// when those are disabled. Setting either is also where a session's
+	// remaining SessionDeadline budget is checked (see setCommandTimeout).
+	ProcessingTimeout = 30 * time.Second
+	IdleTimeout       = 1 * time.Minute
 )
 
 // generateTraceID creates a unique trace ID for correlating logs and tracking emails through the system.
@@ -94,9 +132,13 @@ type RecipientValidationResponse struct {
 	Temporary bool // If true, rejection is temporary (4xx), otherwise permanent (5xx)
 }
 
-// SpamChecker defines the interface for external spam checking (rspamd)
+// SpamChecker defines the interface for external spam checking (rspamd).
+// authenticatedUser is the SMTP AUTH username (empty for unauthenticated
+// relay/inbound mail); it is passed to rspamd as the "User" header so rspamd
+// can recognize authenticated submission as outgoing mail and apply its
+// outbound settings (e.g. skip inbound filtering, sign with DKIM/ARC).
 type SpamChecker interface {
-	Check(ctx context.Context, traceID, message, clientIP, from string, rcpt []string, helo string) (SpamCheckResult, error)
+	Check(ctx context.Context, traceID, message, clientIP, from string, rcpt []string, helo, authenticatedUser string) (SpamCheckResult, error)
 }
 
 // SpamCheckResult represents the result of spam checking
@@ -107,6 +149,7 @@ type SpamCheckResult struct {
 	AddHeaders   map[string][]string // Headers to add (from rspamd milter); each key may map to multiple values when rspamd asks for the same header more than once (e.g. Authentication-Results)
 	ShouldReject bool                // True if message should be permanently rejected (5xx) based on action
 	ShouldDefer  bool                // True if message should be temporarily deferred (4xx), e.g. rspamd "soft reject"
+	SMTPMessage  string              // Custom SMTP reply text from rspamd (messages.smtp_message); used on reject/defer when non-empty, else a generic message
 }
 
 // Backend implements smtp.Backend interface for our custom SMTP server.
@@ -420,72 +463,86 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 			}
 		}
 
-		// Check reverse DNS (PTR record) - helps prevent spam from compromised hosts
-		// Use context with timeout to prevent hanging on unresponsive DNS servers
-		rdnsCtx, rdnsCancel := context.WithTimeout(context.Background(), time.Duration(be.GlobalConfig.DNS.TimeoutSeconds)*time.Second)
-		names, err := be.DNSResolver.LookupAddr(rdnsCtx, remoteAddr)
-		rdnsCancel()
+		// Reverse DNS (PTR) lookup. LookupAddr is uncached and blocks the EHLO
+		// response (NewSession runs again after STARTTLS re-EHLO, so it can fire
+		// twice per message), so only pay for it when something consumes the PTR:
+		// require_rdns, a reputation PTR-hostname whitelist, or a $ptr placeholder
+		// in a sender/recipient validation URL. Submission servers with none of
+		// these skip it — a slow or absent PTR no longer stalls every send.
+		// When skipped, ptrRecord stays "" and hasRDNS stays true (we don't
+		// penalize an IP for a check we chose not to run).
+		if be.ServerConfig.NeedsReverseDNS() {
+			// Use context with timeout to prevent hanging on unresponsive DNS servers
+			rdnsCtx, rdnsCancel := context.WithTimeout(context.Background(), time.Duration(be.GlobalConfig.DNS.TimeoutSeconds)*time.Second)
+			names, err := be.DNSResolver.LookupAddr(rdnsCtx, remoteAddr)
+			rdnsCancel()
 
-		// Distinguish "no PTR record exists" (NXDOMAIN / empty answer) from
-		// transient lookup failures (timeout, SERVFAIL, network blip). Treating
-		// transient errors as "no PTR" rejects legitimate senders whose PTR is
-		// fine — `dig -x` from another resolver succeeds while Mizu's recursor
-		// happens to fail or time out.
-		//
-		// Stats: every code path below falls through to the shared
-		// RecordConnection call at the end of this rDNS block EXCEPT the
-		// reject path, which returns early and records inline. The hasRDNS
-		// argument reflects best-known state:
-		//   - success → true
-		//   - confirmed no PTR → false
-		//   - transient DNS error → true (optimistic; don't penalize the IP
-		//     for our recursor's problem, matching the fail-open policy)
-		switch classifyRDNSResult(names, err) {
-		case rdnsTransient:
-			be.Logger.Warn("Reverse DNS lookup failed transiently - allowing connection",
-				"server", be.ServerConfig.Name,
-				"remote_addr", remoteAddr,
-				"error", err)
-
-		case rdnsMissing:
-			hasRDNS = false
-
-			// Reject if rDNS is required
-			if be.ServerConfig.DNSChecks.RequireRDNS {
-				if be.StatsManager != nil {
-					// Reject returns early; record inline so this connection
-					// still counts toward the IP's connection total.
-					be.StatsManager.RecordConnection(ipStr, false)
-					be.StatsManager.RecordDeniedConnection(ipStr)
-				}
-				if be.Metrics != nil {
-					be.Metrics.SMTPMessagesRejected.WithLabelValues(be.ServerConfig.Name, be.ServerConfig.Type, "no_rdns").Inc()
-				}
-
-				be.Logger.Info("Rejecting connection - no reverse DNS",
+			// Distinguish "no PTR record exists" (NXDOMAIN / empty answer) from
+			// transient lookup failures (timeout, SERVFAIL, network blip). Treating
+			// transient errors as "no PTR" rejects legitimate senders whose PTR is
+			// fine — `dig -x` from another resolver succeeds while Mizu's recursor
+			// happens to fail or time out.
+			//
+			// Stats: every code path below falls through to the shared
+			// RecordConnection call at the end of this rDNS block EXCEPT the
+			// reject path, which returns early and records inline. The hasRDNS
+			// argument reflects best-known state:
+			//   - success → true
+			//   - confirmed no PTR → false
+			//   - transient DNS error → true (optimistic; don't penalize the IP
+			//     for our recursor's problem, matching the fail-open policy)
+			switch classifyRDNSResult(names, err) {
+			case rdnsTransient:
+				be.Logger.Warn("Reverse DNS lookup failed transiently - allowing connection",
 					"server", be.ServerConfig.Name,
-					"remote_addr", remoteAddr)
-				return nil, &smtp.SMTPError{
-					Code:         450,
-					EnhancedCode: smtp.EnhancedCode{4, 7, 25},
-					Message:      fmt.Sprintf("no reverse DNS record for IP address %s", ipStr),
+					"remote_addr", remoteAddr,
+					"error", err)
+
+			case rdnsMissing:
+				hasRDNS = false
+
+				// Reject if rDNS is required, unless the IP is whitelisted
+				rdnsAllowReason := "not_required"
+				if be.ServerConfig.DNSChecks.RequireRDNS {
+					if !ipInNets(ip, be.ServerConfig.DNSChecks.RDNSWhitelistNets()) {
+						if be.StatsManager != nil {
+							// Reject returns early; record inline so this connection
+							// still counts toward the IP's connection total.
+							be.StatsManager.RecordConnection(ipStr, false)
+							be.StatsManager.RecordDeniedConnection(ipStr)
+						}
+						if be.Metrics != nil {
+							be.Metrics.SMTPMessagesRejected.WithLabelValues(be.ServerConfig.Name, be.ServerConfig.Type, "no_rdns").Inc()
+						}
+
+						be.Logger.Info("Rejecting connection - no reverse DNS",
+							"server", be.ServerConfig.Name,
+							"remote_addr", remoteAddr)
+						return nil, &smtp.SMTPError{
+							Code:         450,
+							EnhancedCode: smtp.EnhancedCode{4, 7, 25},
+							Message:      fmt.Sprintf("no reverse DNS record for IP address %s", ipStr),
+						}
+					}
+					rdnsAllowReason = "ip_whitelisted"
 				}
+				be.Logger.Info("Connection allowed without reverse DNS",
+					"server", be.ServerConfig.Name,
+					"remote_addr", remoteAddr,
+					"reason", rdnsAllowReason)
+
+			case rdnsSuccess:
+				ptrRecord = names[0]
+				be.Logger.Info("Reverse DNS resolved",
+					"server", be.ServerConfig.Name,
+					"remote_addr", remoteAddr,
+					"remote_host", ptrRecord)
+
+			default:
+				// Compile-time exhaustiveness isn't enforced; trip loudly if a new
+				// rdnsResult variant gets added without a corresponding arm here.
+				panic(fmt.Sprintf("unhandled rdnsResult: %d", classifyRDNSResult(names, err)))
 			}
-			be.Logger.Info("Connection allowed without reverse DNS (not required)",
-				"server", be.ServerConfig.Name,
-				"remote_addr", remoteAddr)
-
-		case rdnsSuccess:
-			ptrRecord = names[0]
-			be.Logger.Info("Reverse DNS resolved",
-				"server", be.ServerConfig.Name,
-				"remote_addr", remoteAddr,
-				"remote_host", ptrRecord)
-
-		default:
-			// Compile-time exhaustiveness isn't enforced; trip loudly if a new
-			// rdnsResult variant gets added without a corresponding arm here.
-			panic(fmt.Sprintf("unhandled rdnsResult: %d", classifyRDNSResult(names, err)))
 		}
 
 		// Record connection in stats
@@ -498,15 +555,11 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 				isWhitelisted := false
 
 				// Check IP whitelist
-				for _, whitelistEntry := range be.ServerConfig.Reputation.WhitelistIPs {
-					if be.matchIPWhitelist(ipStr, whitelistEntry) {
-						be.Logger.Info("IP is whitelisted - skipping reputation check",
-							"server", be.ServerConfig.Name,
-							"remote_addr", remoteAddr,
-							"whitelist_entry", whitelistEntry)
-						isWhitelisted = true
-						break
-					}
+				if ipInNets(ip, be.ServerConfig.Reputation.WhitelistNets()) {
+					be.Logger.Info("IP is whitelisted - skipping reputation check",
+						"server", be.ServerConfig.Name,
+						"remote_addr", remoteAddr)
+					isWhitelisted = true
 				}
 
 				// Check hostname whitelist (PTR suffix match)
@@ -561,11 +614,17 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		tlsState = &state
 	}
 
-	// Create session context with deadline
-	ctx, cancel := context.WithTimeout(context.Background(), SessionDeadline)
+	// The session context is cancelled on Logout; the session's time budget is
+	// tracked separately by sessionDeadline, which — unlike a context deadline —
+	// can be restarted as the session makes progress.
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Capture the raw connection once, here, where no go-smtp lock is held.
+	// Session callbacks use it for deadlines instead of smtp.Conn.Conn().
+	netConn := c.Conn()
 
 	// Set initial idle timeout
-	if err := c.Conn().SetDeadline(time.Now().Add(IdleTimeout)); err != nil {
+	if err := netConn.SetDeadline(time.Now().Add(IdleTimeout)); err != nil {
 		cancel()
 		be.Logger.Error("Failed to set deadline", "error", err)
 		return nil, ErrInternalServerError
@@ -576,6 +635,7 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 
 	session := &Session{
 		conn:               c,
+		netConn:            netConn,
 		helo:               "",
 		ptr:                ptrRecord,
 		from:               "",
@@ -594,6 +654,7 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		rateLimiter:        be.RateLimiter,
 		metrics:            be.Metrics,
 		ctx:                ctx,
+		baseLogger:         be.Logger,
 		Logger:             be.Logger.With("trace_id", traceID, "remote_addr", remoteAddr, "remote_host", ptrRecord),
 		cancel:             cancel,
 		sessionsWg:         be.ActiveSessionsWg,
@@ -608,6 +669,7 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		recipientValidator: be.RecipientValidator, // Recipient validator (nil if disabled)
 		spamChecker:        be.SpamChecker,        // Spam checker (nil if disabled)
 	}
+	session.sessionDeadline.Store(time.Now().Add(SessionDeadline).UnixNano())
 
 	be.Logger.Info("Session created successfully",
 		"server", be.ServerConfig.Name,
@@ -620,31 +682,14 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	return session, nil
 }
 
-// matchIPWhitelist checks if an IP matches a whitelist entry (supports CIDR)
-func (be *Backend) matchIPWhitelist(ip string, whitelistEntry string) bool {
-	// Parse the IP
-	ipAddr := net.ParseIP(ip)
-	if ipAddr == nil {
-		return false
-	}
-
-	// Check if whitelist entry is a CIDR
-	if strings.Contains(whitelistEntry, "/") {
-		_, ipNet, err := net.ParseCIDR(whitelistEntry)
-		if err != nil {
-			be.Logger.Warn("Invalid CIDR in whitelist", "entry", whitelistEntry, "error", err)
-			return false
+// ipInNets reports whether ip falls within any of the given networks
+func ipInNets(ip net.IP, nets []*net.IPNet) bool {
+	for _, n := range nets {
+		if n.Contains(ip) {
+			return true
 		}
-		return ipNet.Contains(ipAddr)
 	}
-
-	// Exact IP match
-	whitelistIP := net.ParseIP(whitelistEntry)
-	if whitelistIP == nil {
-		be.Logger.Warn("Invalid IP in whitelist", "entry", whitelistEntry)
-		return false
-	}
-	return ipAddr.Equal(whitelistIP)
+	return false
 }
 
 // rdnsResult classifies the outcome of a reverse-DNS (PTR) lookup. The three
@@ -697,8 +742,9 @@ func (be *Backend) matchHostWhitelist(ptrHost string, whitelistHost string) bool
 // It tracks the SMTP conversation state and enforces protocol requirements.
 type Session struct {
 	conn           *smtp.Conn             // The underlying SMTP connection
+	netConn        net.Conn               // Raw connection captured at session creation, for deadlines (see setCommandTimeout)
 	helo           string                 // HELO/EHLO domain from the client
-	ptr            string                 // Reverse DNS (PTR) record for client IP
+	ptr            string                 // Reverse DNS (PTR) record for client IP; "" when NewSession skipped the lookup. If you add a new consumer of this field, update ServerConfig.NeedsReverseDNS so the lookup still runs.
 	from           string                 // Sender's email address (MAIL FROM)
 	to             []string               // Recipient email addresses (RCPT TO)
 	remoteAddr     string                 // Remote IP:port of the client
@@ -715,12 +761,21 @@ type Session struct {
 	distTracker    *DistributedTracker    // Distributed connection tracker (optional, for cluster-wide limits)
 	rateLimiter    *RateLimiter           // Multi-dimensional rate limiter
 	metrics        *metrics.Metrics       // Prometheus metrics for observability
-	ctx            context.Context        // Session context with deadline for timeout
+	ctx            context.Context        // Session context, cancelled on Logout
+	baseLogger     *slog.Logger           // Logger without session attrs, to rebuild Logger when the trace ID rotates
 	Logger         *slog.Logger           // Structured logger for this session
 	cancel         context.CancelFunc     // Cancel function to clean up resources
-	sessionsWg     *sync.WaitGroup        // WaitGroup to track active sessions for graceful shutdown
-	sessionCount   *atomic.Int64          // Pointer to active session counter for observability
-	logoutOnce     sync.Once              // Ensures Logout cleanup runs exactly once
+
+	// sessionDeadline caps time spent without completing a transaction, as
+	// Unix nanoseconds (zero when unset, as in bare test sessions). Unlike a
+	// context deadline it moves: extendSessionDeadline restarts it on progress
+	// and ensureSessionBudget guarantees room for work about to start. Held
+	// atomically because BDAT runs Session.Data on its own goroutine while the
+	// connection goroutine keeps handling commands.
+	sessionDeadline atomic.Int64
+	sessionsWg      *sync.WaitGroup // WaitGroup to track active sessions for graceful shutdown
+	sessionCount    *atomic.Int64   // Pointer to active session counter for observability
+	logoutOnce      sync.Once       // Ensures Logout cleanup runs exactly once
 
 	// Authentication (for submission servers)
 	isAuthenticated   bool             // Whether user has authenticated via SMTP AUTH
@@ -816,10 +871,18 @@ func (s *Session) Helo(hostname string) error {
 }
 
 // heloValidationEnabled reports whether HELO/EHLO hostname validation is
-// enabled for this server. It defaults to true when unset (nil) so validation
-// remains on unless an operator explicitly sets helo_validation = false.
+// enabled for this server. An explicit helo_validation setting always wins.
+// When unset (nil — config.ApplyDefaults normally materializes it), the
+// default is type-aware: enabled on relay (MX) servers where it screens spam
+// bots, disabled on submission servers — authenticated desktop clients
+// (notably Windows Outlook) send their bare machine name as the EHLO
+// argument, and rejecting it locks every such client out (the August 2026
+// Outlook incident).
 func (s *Session) heloValidationEnabled() bool {
-	return s.serverConfig.HELOValidation == nil || *s.serverConfig.HELOValidation
+	if s.serverConfig.HELOValidation != nil {
+		return *s.serverConfig.HELOValidation
+	}
+	return !s.serverConfig.IsSubmission()
 }
 
 // validateHeloHostname checks a HELO/EHLO hostname for security issues.
@@ -908,32 +971,92 @@ func (s *Session) updateTLSState() {
 	}
 }
 
-// setCommandTimeout sets the deadline for the current command
+// setCommandTimeout sets the deadline for the current command.
+//
+// The deadline is set on s.netConn, captured once at session creation, rather
+// than through smtp.Conn.Conn(). That accessor takes go-smtp's per-connection
+// lock, and go-smtp calls Session.Reset (which calls this) from Conn.reset;
+// re-entering the lock from a session callback deadlocks the connection
+// goroutine for good. go-smtp no longer holds the lock across Reset, but not
+// depending on that keeps every session callback safe to call any accessor.
+// The captured value stays current because go-smtp builds a fresh session
+// after STARTTLS swaps the underlying connection.
 func (s *Session) setCommandTimeout(timeout time.Duration) error {
 	// Skip timeout if no connection (e.g., in tests)
-	if s.conn == nil {
+	if s.netConn == nil {
 		return nil
 	}
 
 	// Check if session deadline has been exceeded
-	select {
-	case <-s.ctx.Done():
+	if deadline := s.sessionDeadlineTime(); !deadline.IsZero() && time.Now().After(deadline) {
 		s.Logger.Warn("Session deadline exceeded")
 		return ErrSessionTimeout
-	default:
-		// Set the command timeout
-		deadline := time.Now().Add(timeout)
-		if err := s.conn.Conn().SetDeadline(deadline); err != nil {
-			s.Logger.Error("Failed to set deadline", "error", err)
-			return ErrInternalServerError
-		}
-		return nil
 	}
+
+	// Set the command timeout
+	if err := s.netConn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		s.Logger.Error("Failed to set deadline", "error", err)
+		return ErrInternalServerError
+	}
+	return nil
+}
+
+// sessionDeadlineTime returns the current session deadline, or the zero time
+// when the session has no budget (bare test sessions).
+func (s *Session) sessionDeadlineTime() time.Time {
+	nanos := s.sessionDeadline.Load()
+	if nanos == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, nanos)
+}
+
+// extendSessionDeadline restarts the session's progress budget. Called when a
+// transaction completes, so a sender delivering a queue of messages over one
+// connection is judged on progress rather than on total connection age.
+func (s *Session) extendSessionDeadline() {
+	if s.sessionDeadline.Load() == 0 {
+		return
+	}
+	s.sessionDeadline.Store(time.Now().Add(SessionDeadline).UnixNano())
+}
+
+// ensureSessionBudget guarantees at least d remains before the session
+// deadline. Without it, a transaction starting near the end of the budget would
+// be handed a truncated deadline — and a message rejected with 451 after the
+// backend had already accepted it is a duplicate on the next delivery attempt,
+// not a clean failure.
+func (s *Session) ensureSessionBudget(d time.Duration) {
+	for {
+		current := s.sessionDeadline.Load()
+		if current == 0 {
+			return
+		}
+		minimum := time.Now().Add(d).UnixNano()
+		if current >= minimum {
+			return
+		}
+		if s.sessionDeadline.CompareAndSwap(current, minimum) {
+			return
+		}
+	}
+}
+
+// commandContext derives the context for a command's outbound work from the
+// per-command context go-smtp supplies, bounded by the session deadline.
+// go-smtp cancels its context when the transaction ends or the server shuts
+// down; the session deadline stops work that outlives the session's budget.
+// Callers must call the returned cancel.
+func (s *Session) commandContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if deadline := s.sessionDeadlineTime(); !deadline.IsZero() {
+		return context.WithDeadline(ctx, deadline)
+	}
+	return context.WithCancel(ctx)
 }
 
 // Mail is called for the MAIL FROM command.
 // This sets the envelope sender for the SMTP transaction.
-func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
+func (s *Session) Mail(ctx context.Context, from string, opts *smtp.MailOptions) error {
 	// Reject null sender <> (bounce messages) to prevent backscatter
 	// Check this FIRST before any other processing for security
 	if s.serverConfig.Junk.RejectNullSender && (from == "" || from == "<>") {
@@ -1010,7 +1133,9 @@ func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
 
 	// Perform sender validation if enabled (skip for authenticated sessions - already validated via allowed_from)
 	if !s.isAuthenticated && s.senderValidator != nil && s.serverConfig.SenderValidation.Enabled {
-		result, err := s.senderValidator.ValidateWithContext(s.ctx, s.remoteAddr, s.ptr, s.helo, from, s.authenticatedUser)
+		cmdCtx, cancel := s.commandContext(ctx)
+		result, err := s.senderValidator.ValidateWithContext(cmdCtx, s.remoteAddr, s.ptr, s.helo, from, s.authenticatedUser)
+		cancel()
 		if err != nil {
 			s.Logger.Warn("Sender validation failed", "from", from, "authenticated_user", s.authenticatedUser, "error", err)
 			// Treat validation errors as temporary failures
@@ -1207,7 +1332,7 @@ func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
 
 // Rcpt is called for the RCPT TO command.
 // This validates and adds recipients to the envelope.
-func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
+func (s *Session) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) error {
 	// Set timeout for this command
 	if err := s.setCommandTimeout(ProcessingTimeout); err != nil {
 		return err
@@ -1274,7 +1399,9 @@ func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
 
 	// Perform recipient validation if enabled
 	if s.recipientValidator != nil && s.serverConfig.RecipientValidation.Enabled {
-		result, err := s.recipientValidator.ValidateWithContext(s.ctx, s.remoteAddr, s.ptr, s.helo, s.from, to)
+		cmdCtx, cancel := s.commandContext(ctx)
+		result, err := s.recipientValidator.ValidateWithContext(cmdCtx, s.remoteAddr, s.ptr, s.helo, s.from, to)
+		cancel()
 		if err != nil {
 			s.Logger.Warn("Recipient validation failed", "to", to, "error", err)
 			// Treat validation errors as temporary failures
@@ -1333,7 +1460,12 @@ func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
 
 // Data is called when the email body is received.
 // This is where we process the message headers and body, perform validation, and forward the email.
-func (s *Session) Data(r io.Reader) (err error) {
+func (s *Session) Data(ctx context.Context, r io.Reader) (err error) {
+	// Guarantee the full data budget before anything derives a context from the
+	// session deadline: reading the body and delivering it synchronously must
+	// not be cut short by however much of the session budget happens to remain.
+	s.ensureSessionBudget(DataPhaseBudget)
+
 	// 1. Perform initial checks and read the message data from the client.
 	rawEmail, err := s.readMessageData(r)
 	if err != nil {
@@ -1346,14 +1478,17 @@ func (s *Session) Data(r io.Reader) (err error) {
 		return s.handleLocalMode(rawEmail)
 	}
 
+	cmdCtx, cancel := s.commandContext(ctx)
+	defer cancel()
+
 	// 3. Perform pre-delivery validation (headers, DMARC, etc.).
 	// This may mark the message as junk or return a hard rejection error.
-	if err := s.performPreDeliveryChecks(rawEmail); err != nil {
+	if err := s.performPreDeliveryChecks(cmdCtx, rawEmail); err != nil {
 		return err
 	}
 
 	// 4. Attempt to deliver the message to the final destination.
-	if err := s.deliverMessage(rawEmail); err != nil {
+	if err := s.deliverMessage(cmdCtx, rawEmail); err != nil {
 		return err
 	}
 
@@ -1365,8 +1500,9 @@ func (s *Session) Data(r io.Reader) (err error) {
 
 // readMessageData handles the initial checks and reads the email content from the client.
 func (s *Session) readMessageData(r io.Reader) (string, error) {
-	// Set extended timeout for receiving potentially large email data.
-	if err := s.setCommandTimeout(DataTimeout); err != nil {
+	// Arm the first block's deadline (and check the session budget); the
+	// rolling reader below re-arms it as the body arrives.
+	if err := s.setCommandTimeout(DataBlockTimeout); err != nil {
 		return "", err
 	}
 
@@ -1393,11 +1529,16 @@ func (s *Session) readMessageData(r io.Reader) (string, error) {
 	// own 552; either path yields a rejection. go-smtp discards any remaining
 	// DATA after this returns.
 	maxSize := int64(s.serverConfig.MaxMessageSize)
+	// Bound how long the client may stall mid-message rather than how long the
+	// whole body may take: every chunk that arrives pushes the deadline out by
+	// DataBlockTimeout, so a slow uplink can keep sending while a client that
+	// goes silent is still dropped. The session deadline, guaranteed a full
+	// DataPhaseBudget by Data, is the ceiling the extensions cannot push past.
+	reader := newRollingDeadlineReader(r, s.netConn, DataBlockTimeout, s.sessionDeadlineTime())
 	// A non-positive limit means unlimited; only wrap with a bounded reader when
 	// a real limit is configured (otherwise LimitReader(r, 1) would truncate).
-	reader := io.Reader(r)
 	if maxSize > 0 {
-		reader = io.LimitReader(r, maxSize+1)
+		reader = io.LimitReader(reader, maxSize+1)
 	}
 	n, err := io.Copy(&s.mailData, reader)
 	if err != nil {
@@ -1450,7 +1591,7 @@ func (s *Session) handleLocalMode(rawEmail string) error {
 
 // performPreDeliveryChecks runs all content validation checks (headers, DMARC).
 // It may mark the message as junk or return an SMTPError for a hard rejection.
-func (s *Session) performPreDeliveryChecks(rawEmail string) error {
+func (s *Session) performPreDeliveryChecks(ctx context.Context, rawEmail string) error {
 	// Mail loop detection (check before other validations to prevent wasting resources)
 	loopDetectionEnabled := s.serverConfig.Validation.LoopDetection != nil && *s.serverConfig.Validation.LoopDetection
 	if loopDetectionEnabled {
@@ -1520,7 +1661,7 @@ func (s *Session) performPreDeliveryChecks(rawEmail string) error {
 			txtResolver = s.dnsResolver
 		}
 		lookupTimeout := time.Duration(s.globalConfig.DNS.TimeoutSeconds) * time.Second
-		dmarcResult, err = validation.CheckDMARC(s.ctx, rawEmail, s.spfResult, quarantineAction, txtResolver, lookupTimeout, s.Logger)
+		dmarcResult, err = validation.CheckDMARC(ctx, rawEmail, s.spfResult, quarantineAction, txtResolver, lookupTimeout, s.Logger)
 	}
 	s.dmarcResult = dmarcResult
 	if err != nil {
@@ -1643,7 +1784,7 @@ func (s *Session) performPreDeliveryChecks(rawEmail string) error {
 
 	// External spam checking (rspamd)
 	if s.spamChecker != nil {
-		result, err := s.spamChecker.Check(context.Background(), s.traceID, rawEmail, s.remoteAddr, s.from, s.to, s.helo)
+		result, err := s.spamChecker.Check(ctx, s.traceID, rawEmail, s.remoteAddr, s.from, s.to, s.helo, s.authenticatedUser)
 		if err != nil {
 			s.Logger.Warn("Spam check failed", "error", err)
 			if s.metrics != nil {
@@ -1665,10 +1806,17 @@ func (s *Session) performPreDeliveryChecks(rawEmail string) error {
 				if s.metrics != nil {
 					s.metrics.SMTPMessagesRejected.WithLabelValues(s.serverName(), s.serverType(), "spam_soft_reject").Inc()
 				}
+				// Prefer rspamd's own reply text (e.g. "Reached account
+				// incoming limits ... Try again later.") when it set one,
+				// falling back to a generic notice.
+				message := result.SMTPMessage
+				if message == "" {
+					message = "message deferred, please try again later"
+				}
 				return &smtp.SMTPError{
 					Code:         451,
 					EnhancedCode: smtp.EnhancedCode{4, 7, 1},
-					Message:      "message deferred, please try again later",
+					Message:      message,
 				}
 			}
 
@@ -1678,10 +1826,17 @@ func (s *Session) performPreDeliveryChecks(rawEmail string) error {
 				if s.metrics != nil {
 					s.metrics.SMTPMessagesRejected.WithLabelValues(s.serverName(), s.serverType(), "spam_reject").Inc()
 				}
+				// Prefer rspamd's own reply text (e.g. "Reached account
+				// outgoing limits for account #123") when it set one, falling
+				// back to a generic notice.
+				message := result.SMTPMessage
+				if message == "" {
+					message = "message rejected - spam detected"
+				}
 				return &smtp.SMTPError{
 					Code:         550,
 					EnhancedCode: smtp.EnhancedCode{5, 7, 1},
-					Message:      "message rejected - spam detected",
+					Message:      message,
 				}
 			}
 
@@ -1703,7 +1858,7 @@ func (s *Session) performPreDeliveryChecks(rawEmail string) error {
 // deliverMessage attempts to post the email to the destination endpoint.
 // It translates delivery errors into appropriate SMTP temporary or permanent failure codes.
 // It also checks the recipient cache before attempting delivery and caches 404/403 responses.
-func (s *Session) deliverMessage(rawEmail string) error {
+func (s *Session) deliverMessage(ctx context.Context, rawEmail string) error {
 	// Step 1: Inject Received and X-Mizu-* headers
 	// This must happen BEFORE ARC signing so the signature covers these headers
 	tlsVersionStr := "none"
@@ -1786,16 +1941,16 @@ func (s *Session) deliverMessage(rawEmail string) error {
 
 	// ARC signing removed - Mizu is SMTP-to-HTTP relay, never forwards messages
 	// Deliver message synchronously (no ARC signing needed)
-	return s.deliverSynchronous(emailWithHeaders)
+	return s.deliverSynchronous(ctx, emailWithHeaders)
 }
 
 // deliverSynchronous handles synchronous delivery
-func (s *Session) deliverSynchronous(signedEmail string) error {
+func (s *Session) deliverSynchronous(ctx context.Context, signedEmail string) error {
 	// Per-recipient POST to Mailqueuer. Each request is atomic: one recipient,
 	// one queue message, one S3 object. On first failure, stop and return the
 	// error — the sending MTA will retry all recipients.
 	for _, recipient := range s.to {
-		if err := s.deliverToRecipient(signedEmail, recipient); err != nil {
+		if err := s.deliverToRecipient(ctx, signedEmail, recipient); err != nil {
 			return err
 		}
 	}
@@ -1804,7 +1959,7 @@ func (s *Session) deliverSynchronous(signedEmail string) error {
 	return nil
 }
 
-func (s *Session) deliverToRecipient(signedEmail string, recipient string) error {
+func (s *Session) deliverToRecipient(ctx context.Context, signedEmail string, recipient string) error {
 	// Check recipient cache first (if distributed tracking is enabled)
 	if s.distTracker != nil {
 		if found, isBlocked, reason := s.distTracker.IsRecipientCached(recipient); found {
@@ -1822,7 +1977,7 @@ func (s *Session) deliverToRecipient(signedEmail string, recipient string) error
 	emailForRecipient := addEnvelopeToHeader(signedEmail, recipient)
 
 	err := poster.PostEmailToDestinationWithContext(
-		s.ctx,
+		ctx,
 		emailForRecipient,
 		s.serverConfig.Delivery.URL,
 		s.serverConfig.Delivery.AuthToken,
@@ -1887,6 +2042,12 @@ func (s *Session) finalizeSuccessfulDelivery() {
 			s.statsManager.RecordDeliveryRecipients(s.to, true)
 		}
 	}
+	// A completed transaction is the progress the session budget measures:
+	// restart it so a sender working through a queue on this connection is not
+	// disconnected mid-stream, which would force redelivery of every message it
+	// had not yet been told we accepted.
+	s.extendSessionDeadline()
+
 	s.Logger.Info("Email delivered successfully",
 		"from", s.from,
 		"to", s.to,
@@ -2030,6 +2191,20 @@ func (s *Session) validateHeaders(rawEmail string) error {
 // Reset is called to reset the session after a message.
 func (s *Session) Reset() {
 	s.Logger.Debug("Session reset")
+	// A later message on the same connection is a different email — rotate the
+	// trace ID so one trace ID always means one message. This also keeps
+	// mailqueuer's (trace_id, recipient) ingest dedup from ever suppressing a
+	// second, distinct message to the same recipient on this connection.
+	previousTraceID := s.traceID
+	s.traceID = generateTraceID()
+	if s.baseLogger != nil { // bare test sessions have no baseLogger
+		s.Logger = s.baseLogger.With("trace_id", s.traceID, "remote_addr", s.remoteAddr, "remote_host", s.ptr)
+	}
+	// Reset also fires on RSET and repeated EHLO, so connection/auth-time log
+	// lines carry an earlier trace ID than the message eventually delivered on
+	// this session. This line chains the IDs so a grep for either finds the
+	// rotation and can follow the session history.
+	s.Logger.Info("Trace ID rotated", "previous_trace_id", previousTraceID)
 	s.from = ""
 	s.to = make([]string, 0)
 	s.mailData.Reset()

@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +33,15 @@ type AuthRateLimiter struct {
 	ipFailureCounts map[string]*IPFailureInfo
 	ipMu            sync.RWMutex
 
+	// Tier 3: subnet blocking (auth_subnet.go)
+	subnets      map[string]*SubnetInfo
+	subnetMu     sync.RWMutex
+	subnetExempt []netip.Prefix
+
+	// Recent successful logins, exempted from subnet blocks
+	goodIPs map[string]time.Time
+	goodMu  sync.RWMutex
+
 	// Username tracking (statistics only)
 	usernameFailureCounts map[string]*UsernameFailureInfo
 	usernameMu            sync.RWMutex
@@ -47,6 +58,9 @@ type AuthRateLimiter struct {
 	ipUsernameWindowDuration time.Duration
 	ipBlockDuration          time.Duration
 	ipWindowDuration         time.Duration
+	subnetBlockDuration      time.Duration
+	subnetWindowDuration     time.Duration
+	successExemptDuration    time.Duration
 	usernameWindowDuration   time.Duration
 	initialDelay             time.Duration
 	maxDelay                 time.Duration
@@ -109,6 +123,30 @@ func NewAuthRateLimiter(cfg config.ServerAuthRateLimitConfig, logger *slog.Logge
 		return nil, fmt.Errorf("invalid ip_window_duration: %w", err)
 	}
 
+	subnetBlockDuration, err := parseDuration(cfg.SubnetBlockDuration, 30*time.Minute)
+	if err != nil {
+		return nil, fmt.Errorf("invalid subnet_block_duration: %w", err)
+	}
+
+	subnetWindowDuration, err := parseDuration(cfg.SubnetWindowDuration, 30*time.Minute)
+	if err != nil {
+		return nil, fmt.Errorf("invalid subnet_window_duration: %w", err)
+	}
+
+	successExemptDuration, err := parseDuration(cfg.SuccessExemptDuration, 24*time.Hour)
+	if err != nil {
+		return nil, fmt.Errorf("invalid success_exempt_duration: %w", err)
+	}
+
+	subnetExempt := make([]netip.Prefix, 0, len(cfg.SubnetExempt))
+	for _, cidr := range cfg.SubnetExempt {
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid subnet_exempt entry %q: %w", cidr, err)
+		}
+		subnetExempt = append(subnetExempt, prefix.Masked())
+	}
+
 	usernameWindowDuration, err := parseDuration(cfg.UsernameWindowDuration, 1*time.Hour)
 	if err != nil {
 		return nil, fmt.Errorf("invalid username_window_duration: %w", err)
@@ -139,11 +177,17 @@ func NewAuthRateLimiter(cfg config.ServerAuthRateLimitConfig, logger *slog.Logge
 		blockedIPUsernames:       make(map[string]*BlockedIPUsernameInfo),
 		blockedIPs:               make(map[string]*BlockedIPInfo),
 		ipFailureCounts:          make(map[string]*IPFailureInfo),
+		subnets:                  make(map[string]*SubnetInfo),
+		subnetExempt:             subnetExempt,
+		goodIPs:                  make(map[string]time.Time),
 		usernameFailureCounts:    make(map[string]*UsernameFailureInfo),
 		ipUsernameBlockDuration:  ipUsernameBlockDuration,
 		ipUsernameWindowDuration: ipUsernameWindowDuration,
 		ipBlockDuration:          ipBlockDuration,
 		ipWindowDuration:         ipWindowDuration,
+		subnetBlockDuration:      subnetBlockDuration,
+		subnetWindowDuration:     subnetWindowDuration,
+		successExemptDuration:    successExemptDuration,
 		usernameWindowDuration:   usernameWindowDuration,
 		initialDelay:             initialDelay,
 		maxDelay:                 maxDelay,
@@ -164,6 +208,9 @@ func (a *AuthRateLimiter) MaxBlockDuration() time.Duration {
 	max := a.ipBlockDuration
 	if a.ipUsernameBlockDuration > max {
 		max = a.ipUsernameBlockDuration
+	}
+	if a.subnetBlockDuration > max {
+		max = a.subnetBlockDuration
 	}
 	return max
 }
@@ -187,6 +234,10 @@ func (a *AuthRateLimiter) CanAttemptAuth(ctx context.Context, ip, username strin
 	if !a.config.Enabled {
 		return nil
 	}
+
+	// Every tier keys on the bucketed identity (IPv6 → its /64), or a v6
+	// attacker rotates addresses inside one allocation for free.
+	ip = bucketIP(ip)
 
 	// Check Tier 1: IP+username blocking (only if enabled)
 	if a.config.MaxAttemptsPerIPUsername > 0 && username != "" {
@@ -220,6 +271,14 @@ func (a *AuthRateLimiter) CanAttemptAuth(ctx context.Context, ip, username strin
 	}
 	a.ipMu.RUnlock()
 
+	// Check Tier 3: subnet blocking (recently-successful IPs pass through)
+	if blockedUntil, blocked := a.subnetBlocked(ip, time.Now()); blocked {
+		a.logger.Warn("authentication blocked (subnet)",
+			"ip", ip,
+			"blocked_until", blockedUntil)
+		return fmt.Errorf("rate limit exceeded for this network")
+	}
+
 	return nil
 }
 
@@ -228,6 +287,8 @@ func (a *AuthRateLimiter) GetAuthenticationDelay(ip string) time.Duration {
 	if !a.config.Enabled {
 		return 0
 	}
+
+	ip = bucketIP(ip)
 
 	a.ipMu.RLock()
 	defer a.ipMu.RUnlock()
@@ -256,6 +317,8 @@ func (a *AuthRateLimiter) RecordAuthAttempt(ctx context.Context, ip, username st
 		return
 	}
 
+	ip = bucketIP(ip)
+
 	if success {
 		a.recordSuccess(ip, username)
 	} else {
@@ -275,6 +338,12 @@ func (a *AuthRateLimiter) recordSuccess(ip, username string) {
 	a.ipMu.Lock()
 	delete(a.ipFailureCounts, ip)
 	a.ipMu.Unlock()
+
+	// Stamp the subnet-block bypass and stop counting this address toward
+	// its subnet's fate (the subnet's BLOCK state, if any, stays — one
+	// cracked credential must not lift it)
+	a.recordGoodIP(ip, time.Now())
+	a.clearSubnetMember(ip)
 
 	// Clear username failure (but track success)
 	a.usernameMu.Lock()
@@ -305,6 +374,9 @@ func (a *AuthRateLimiter) recordFailure(ip, username string) {
 
 	// Update Tier 2: IP-only
 	a.updateIPFailure(ip, now)
+
+	// Update Tier 3: subnet
+	a.noteSubnetFailure(ip, 0, now)
 
 	// Update username tracking (only if enabled)
 	if a.config.MaxAttemptsPerUsername > 0 && username != "" {
@@ -696,6 +768,26 @@ func (a *AuthRateLimiter) cleanup() {
 	}
 	a.ipMu.Unlock()
 
+	// Cleanup subnet tracking: drop members that fell out of the window,
+	// then subnets with neither members nor a live block
+	a.subnetMu.Lock()
+	for subnet, info := range a.subnets {
+		pruneSubnetMembers(info, now, a.subnetWindowDuration)
+		if len(info.Members) == 0 && now.After(info.BlockedUntil) {
+			delete(a.subnets, subnet)
+		}
+	}
+	a.subnetMu.Unlock()
+
+	// Cleanup expired success stamps
+	a.goodMu.Lock()
+	for ip, seen := range a.goodIPs {
+		if now.Sub(seen) > a.successExemptDuration {
+			delete(a.goodIPs, ip)
+		}
+	}
+	a.goodMu.Unlock()
+
 	// Cleanup username tracking
 	a.usernameMu.Lock()
 	for username, info := range a.usernameFailureCounts {
@@ -706,14 +798,30 @@ func (a *AuthRateLimiter) cleanup() {
 	a.usernameMu.Unlock()
 }
 
-// RemoveIP removes an IP from the blocked list and failure tracking, and broadcasts to the cluster.
-// Implements health.IPUnblocker interface.
+// RemoveIP removes an IP — or, given CIDR notation, a blocked subnet — from
+// tracking, and broadcasts to the cluster. Implements health.IPUnblocker.
 func (a *AuthRateLimiter) RemoveIP(ip string) bool {
+	if strings.Contains(ip, "/") {
+		// Canonicalize BEFORE broadcasting: peers' gossip sanitizer refuses a
+		// non-masked prefix, so an operator's "203.0.113.5/24" must leave
+		// this node as "203.0.113.0/24" or the unblock stays local-only.
+		prefix, err := netip.ParsePrefix(ip)
+		if err != nil {
+			return false
+		}
+		subnet := prefix.Masked().String()
+		removed := a.ApplyUnblockSubnet(subnet)
+		if removed && a.clusterLimiter != nil {
+			a.clusterLimiter.BroadcastUnblockSubnet(subnet)
+		}
+		return removed
+	}
+
 	removed := a.ApplyUnblockIP(ip)
 
 	// Broadcast to cluster if available
 	if removed && a.clusterLimiter != nil {
-		a.clusterLimiter.BroadcastUnblockIP(ip)
+		a.clusterLimiter.BroadcastUnblockIP(bucketIP(ip))
 	}
 
 	return removed
@@ -722,8 +830,9 @@ func (a *AuthRateLimiter) RemoveIP(ip string) bool {
 // ApplyUnblockIP removes an IP from the blocked list and failure tracking (local only, no broadcast).
 // Used by cluster event handler to apply unblocks from other nodes.
 func (a *AuthRateLimiter) ApplyUnblockIP(ip string) bool {
+	ip = bucketIP(ip)
+
 	a.ipMu.Lock()
-	defer a.ipMu.Unlock()
 
 	_, blockedExists := a.blockedIPs[ip]
 	_, failureExists := a.ipFailureCounts[ip]
@@ -738,15 +847,21 @@ func (a *AuthRateLimiter) ApplyUnblockIP(ip string) bool {
 			"was_blocked", blockedExists,
 			"had_failures", failureExists)
 	}
+	a.ipMu.Unlock()
+
+	// An operator vouching for an address also stops it counting toward its
+	// subnet's distinct-failure set (the subnet's own block, if already
+	// standing, is lifted separately via CIDR).
+	a.clearSubnetMember(ip)
 
 	return removed
 }
 
 // ApplyBlockIP applies a block from cluster sync
 func (a *AuthRateLimiter) ApplyBlockIP(ip string, blockedUntil time.Time, failureCount int, firstFailure time.Time) {
-	a.ipMu.Lock()
-	defer a.ipMu.Unlock()
+	ip = bucketIP(ip)
 
+	a.ipMu.Lock()
 	// Only apply if newer or not exists
 	existing, exists := a.blockedIPs[ip]
 	if !exists || blockedUntil.After(existing.BlockedUntil) {
@@ -762,13 +877,19 @@ func (a *AuthRateLimiter) ApplyBlockIP(ip string, blockedUntil time.Time, failur
 			"blocked_until", blockedUntil,
 			"failure_count", failureCount)
 	}
+	a.ipMu.Unlock()
+
+	// A peer blocking this IP is prime evidence of a failing subnet member;
+	// without this, a deployment syncing blocks but not failure counts would
+	// leave the subnet tier blind to cluster-observed rotation.
+	a.noteSubnetFailure(ip, failureCount, time.Now())
 }
 
 // ApplyFailureCount applies failure count from cluster sync
 func (a *AuthRateLimiter) ApplyFailureCount(ip string, failureCount int, lastDelay time.Duration, firstFailure time.Time) {
-	a.ipMu.Lock()
-	defer a.ipMu.Unlock()
+	ip = bucketIP(ip)
 
+	a.ipMu.Lock()
 	// Only apply if higher count or not exists
 	existing, exists := a.ipFailureCounts[ip]
 	if !exists || failureCount > existing.FailureCount {
@@ -784,6 +905,13 @@ func (a *AuthRateLimiter) ApplyFailureCount(ip string, failureCount int, lastDel
 			"failure_count", failureCount,
 			"last_delay", lastDelay)
 	}
+	a.ipMu.Unlock()
+
+	// Feed the subnet tracker: FAILURE_COUNT events carry the failing IP, so
+	// a rotation spread across cluster nodes still converges on one subnet
+	// verdict. Distinct-set semantics make this merge idempotent — the same
+	// IP reported twice is still one member.
+	a.noteSubnetFailure(ip, failureCount, time.Now())
 }
 
 // ApplyUsernameFailure applies username failure from cluster sync
@@ -833,11 +961,29 @@ func (a *AuthRateLimiter) GetStats() map[string]interface{} {
 	usernameFailureCount := len(a.usernameFailureCounts)
 	a.usernameMu.RUnlock()
 
+	now := time.Now()
+	a.subnetMu.RLock()
+	subnetCount := len(a.subnets)
+	blockedSubnetCount := 0
+	for _, info := range a.subnets {
+		if now.Before(info.BlockedUntil) {
+			blockedSubnetCount++
+		}
+	}
+	a.subnetMu.RUnlock()
+
+	a.goodMu.RLock()
+	goodIPCount := len(a.goodIPs)
+	a.goodMu.RUnlock()
+
 	return map[string]interface{}{
 		"enabled":                   a.config.Enabled,
 		"blocked_ip_username":       blockedIPUsernameCount,
 		"blocked_ips":               blockedIPCount,
 		"ip_failure_tracking":       ipFailureCount,
+		"blocked_subnets":           blockedSubnetCount,
+		"subnet_tracking":           subnetCount,
+		"good_ips":                  goodIPCount,
 		"username_failure_tracking": usernameFailureCount,
 	}
 }

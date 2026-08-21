@@ -3,6 +3,7 @@ package config
 import (
 	"net"
 	"strconv"
+	"strings"
 )
 
 // Config holds all configuration for the SMTP server(s)
@@ -24,10 +25,16 @@ type Config struct {
 type DefaultsConfig struct {
 	Hostname               string `toml:"hostname"`                 // Default hostname (FQDN) for all servers
 	MaxMessageSize         int    `toml:"max_message_size"`         // Default max message size in bytes
-	TimeoutSeconds         int    `toml:"timeout_seconds"`          // Default SMTP command timeout
+	TimeoutSeconds         int    `toml:"timeout_seconds"`          // Default SMTP command timeout (see ServerConfig.TimeoutSeconds)
 	ShutdownTimeoutSeconds int    `toml:"shutdown_timeout_seconds"` // Default graceful shutdown timeout
 	MaxConnections         int    `toml:"max_connections"`          // Default max total connections per server
 }
+
+// MaxMessageSizeLimit is the hard ceiling on a server's max_message_size.
+// Messages are fully buffered in memory (once per session during DATA, and
+// again per recipient during delivery), so a limit beyond this is a
+// memory-exhaustion risk regardless of what the operator asked for.
+const MaxMessageSizeLimit = 100 * 1024 * 1024 // 100 MiB
 
 // ServerConfig defines a single SMTP server instance
 type ServerConfig struct {
@@ -36,10 +43,11 @@ type ServerConfig struct {
 	Type string `toml:"type"` // "relay" (MX server) or "submission" (MSA server). Relay servers have no milter/rspamd and stamp only Received + X-Mizu-Trace-ID (X-Mizu-Authentication-Results, X-Mizu-Junk, and spam/milter headers are omitted). The type also sets the default for strip_client_identity.
 
 	// === Network ===
-	ListenAddr           string   `toml:"listen_addr"`            // Address to bind (e.g., ":25", ":465", ":587", "127.0.0.1:2525")
-	Hostname             string   `toml:"hostname"`               // Server hostname/FQDN (overrides defaults.hostname if set)
-	ProxyProtocol        bool     `toml:"proxy_protocol"`         // Enable HAProxy PROXY protocol v1/v2 (real client IP from PROXY header)
-	ProxyProtocolTrusted []string `toml:"proxy_protocol_trusted"` // CIDRs/IPs allowed to send PROXY headers (required when proxy_protocol=true)
+	ListenAddr           string       `toml:"listen_addr"`            // Address to bind (e.g., ":25", ":465", ":587", "127.0.0.1:2525")
+	Hostname             string       `toml:"hostname"`               // Server hostname/FQDN (overrides defaults.hostname if set)
+	ProxyProtocol        bool         `toml:"proxy_protocol"`         // Enable HAProxy PROXY protocol v1/v2 (real client IP from PROXY header)
+	ProxyProtocolTrusted []string     `toml:"proxy_protocol_trusted"` // CIDRs/IPs allowed to send PROXY headers (required when proxy_protocol=true)
+	proxyTrustedNets     []*net.IPNet // ProxyProtocolTrusted parsed by Validate
 
 	// === Message Processing ===
 	MaxMessageSize          int `toml:"max_message_size"`           // Maximum message size in bytes (overrides default)
@@ -52,8 +60,36 @@ type ServerConfig struct {
 	TLS ServerTLSConfig `toml:"tls"` // TLS configuration (if section present, TLS is enabled)
 
 	// === Timeouts ===
+	// TimeoutSeconds is how long the server waits for the next command from
+	// the client (and for a response write to drain). RFC 5321 §4.5.3.2.7
+	// sets the floor at 5 minutes, which is also Postfix's smtpd_timeout
+	// default; anything shorter disconnects legitimate clients that pause
+	// between commands — a desktop MUA doing a slow reverse-DNS lookup of its
+	// own LAN address before EHLO, a laggy mobile uplink, an on-access virus
+	// scanner. Such a client sees the connection drop right after the banner
+	// or mid-conversation and cannot distinguish it from a network fault.
+	//
+	// A short value buys almost no DoS protection: an attacker holding a slot
+	// only has to trickle one command per interval to stay under it, and total
+	// connection lifetime is bounded independently by smtp.SessionDeadline.
+	// Cap concurrency with limits.max_connections / max_connections_per_ip
+	// instead.
 	TimeoutSeconds         int `toml:"timeout_seconds"`          // SMTP command timeout (overrides default)
 	ShutdownTimeoutSeconds int `toml:"shutdown_timeout_seconds"` // Graceful shutdown timeout (overrides default)
+
+	// === Client Compatibility ===
+	// LegacyAuthCap advertises the obsolete "AUTH=<mechanisms>" EHLO line in
+	// addition to the standard "AUTH <mechanisms>" capability on submission
+	// servers. Microsoft Outlook lineages look for the legacy form and refuse
+	// to attempt authentication when it is absent (the August 2026 "new
+	// Outlook cannot connect" incident); Postfix ships the same workaround as
+	// broken_sasl_auth_clients. Default: true.
+	LegacyAuthCap *bool `toml:"legacy_auth_cap"`
+	// AdvertiseLimits re-enables the "LIMITS RCPTMAX=..." (RFC 9422) EHLO
+	// capability, advertised when max_recipients_per_message is set. Off by
+	// default: the extension is young and can confuse client capability
+	// parsers. Default: false.
+	AdvertiseLimits bool `toml:"advertise_limits"`
 
 	// === Debugging ===
 	Debug              bool `toml:"debug"`                // Enable SMTP protocol debug logging (shows all SMTP commands and responses)
@@ -70,7 +106,7 @@ type ServerConfig struct {
 	StripClientIdentity *bool `toml:"strip_client_identity"`
 
 	// === Email Validation ===
-	HELOValidation        *bool  `toml:"helo_validation"`         // Validate HELO/EHLO hostname for security (default: true, set to false to disable)
+	HELOValidation        *bool  `toml:"helo_validation"`         // Validate HELO/EHLO hostname (default: true on relay, false on submission — Windows MUAs send bare machine names; explicit setting wins)
 	SPFCheck              bool   `toml:"spf_check"`               // Enable SPF validation
 	DKIMCheck             bool   `toml:"dkim_check"`              // Enable DKIM validation
 	ARCCheck              bool   `toml:"arc_check"`               // Enable ARC validation
@@ -126,6 +162,13 @@ type ServerReputationConfig struct {
 	WhitelistIPs   []string                    `toml:"whitelist_ips"`    // IP addresses/CIDRs to whitelist (e.g., ["1.2.3.4", "10.0.0.0/8"])
 	WhitelistHosts []string                    `toml:"whitelist_hosts"`  // PTR hostnames to whitelist (suffix match, e.g., ["hetrixtools.com", "pingdom.com"])
 	DNSBL          ServerReputationDNSBLConfig `toml:"dnsbl"`            // DNS blacklist checking that feeds into reputation scoring
+	whitelistNets  []*net.IPNet                // WhitelistIPs parsed by ServerConfig.Validate
+}
+
+// WhitelistNets returns the parsed whitelist_ips networks. Populated by
+// ServerConfig.Validate.
+func (c *ServerReputationConfig) WhitelistNets() []*net.IPNet {
+	return c.whitelistNets
 }
 
 // ServerReputationDNSBLConfig holds DNSBL checking configuration for reputation
@@ -165,6 +208,22 @@ type ServerAuthRateLimitConfig struct {
 	IPBlockDuration  string `toml:"ip_block_duration"`   // Block duration (default: "30m")
 	IPWindowDuration string `toml:"ip_window_duration"`  // Sliding window for counting failures (default: "30m")
 
+	// TIER 3: Subnet Blocking
+	// Catches attackers rotating through sibling IPs (one failure per address,
+	// so tiers 1-2 never accumulate). Triggers on BREADTH — distinct failing
+	// IPs inside one subnet — not raw failure volume, so a shared NAT where a
+	// few users mistype passwords never qualifies. IPv4 groups by /24; IPv6
+	// counts distinct /64s inside a /48 (a /64 is one subscriber, so
+	// per-address counting would hand v6 attackers 2^64 free identities).
+	SubnetMaxDistinctIPs  int      `toml:"subnet_max_distinct_ips"` // Distinct failing IPv4 addresses / IPv6 64s before the subnet blocks (default: 8, negative = tier disabled)
+	SubnetMinFailures     int      `toml:"subnet_min_failures"`     // Minimum total failures in the window before the subnet blocks (default: 15)
+	SubnetWindowDuration  string   `toml:"subnet_window_duration"`  // Sliding window for the distinct-IP set (default: "30m")
+	SubnetBlockDuration   string   `toml:"subnet_block_duration"`   // Block duration (default: "30m")
+	SubnetIPv4Prefix      int      `toml:"subnet_ipv4_prefix"`      // IPv4 grouping prefix length (default: 24)
+	SubnetIPv6Prefix      int      `toml:"subnet_ipv6_prefix"`      // IPv6 grouping prefix length (default: 48)
+	SubnetExempt          []string `toml:"subnet_exempt"`           // CIDRs never subnet-blocked (own infra, known customers); private/loopback are always exempt
+	SuccessExemptDuration string   `toml:"success_exempt_duration"` // How long a successful login exempts its IP from subnet blocks (default: "24h")
+
 	// USERNAME TRACKING (Statistics Only - No Blocking)
 	// Synchronized across cluster for detecting compromised accounts
 	MaxAttemptsPerUsername int    `toml:"max_attempts_per_username"` // Tracking threshold (default: 100, no blocking)
@@ -185,6 +244,7 @@ type ServerAuthRateLimitConfig struct {
 	MaxIPUsernameEntries int `toml:"max_ip_username_entries"` // Max IP+username tracking entries (default: 100000, 0 = unlimited)
 	MaxIPEntries         int `toml:"max_ip_entries"`          // Max IP tracking entries (default: 50000, 0 = unlimited)
 	MaxUsernameEntries   int `toml:"max_username_entries"`    // Max username tracking entries (default: 50000, 0 = unlimited)
+	MaxSubnetEntries     int `toml:"max_subnet_entries"`      // Max subnet tracking entries (default: 10000, 0 = unlimited)
 
 	// CLUSTER SYNCHRONIZATION
 	// Syncs auth failures and blocks across cluster via gossip
@@ -219,6 +279,20 @@ type ServerDNSChecksConfig struct {
 	RequireRDNS           bool `toml:"require_rdns"`            // Require reverse DNS for sender IP
 	RequireSenderMX       bool `toml:"require_sender_mx"`       // Require sender domain to have MX records
 	RequireResolvableHELO bool `toml:"require_resolvable_helo"` // Require HELO hostname to have DNS records (default: false)
+
+	// RDNSWhitelistIPs lists IP addresses/CIDRs exempt from require_rdns
+	// (e.g., ["1.2.3.4", "10.0.0.0/8"]). The exemption covers only the rDNS
+	// requirement; reputation checks still apply (use reputation.whitelist_ips
+	// to bypass those). Sessions admitted without a PTR record interpolate
+	// $ptr as an empty string in sender/recipient validation URLs.
+	RDNSWhitelistIPs  []string     `toml:"rdns_whitelist_ips"`
+	rdnsWhitelistNets []*net.IPNet // RDNSWhitelistIPs parsed by ServerConfig.Validate
+}
+
+// RDNSWhitelistNets returns the parsed rdns_whitelist_ips networks. Populated
+// by ServerConfig.Validate.
+func (c *ServerDNSChecksConfig) RDNSWhitelistNets() []*net.IPNet {
+	return c.rdnsWhitelistNets
 }
 
 // ServerJunkConfig holds junk/spam detection configuration
@@ -251,6 +325,12 @@ type ServerTLSConfig struct {
 	MaxTLSVersion string `toml:"max_tls_version"` // Maximum TLS version: "1.2" or "1.3" (empty = no cap). Set to "1.2" for Exchange Online interop.
 }
 
+// ProxyTrustedNets returns the parsed proxy_protocol_trusted networks.
+// Populated by ServerConfig.Validate.
+func (s *ServerConfig) ProxyTrustedNets() []*net.IPNet {
+	return s.proxyTrustedNets
+}
+
 // IsRelay returns true if this is a relay (MX) server
 func (s *ServerConfig) IsRelay() bool {
 	return s.Type == "relay"
@@ -271,6 +351,13 @@ func (s *ServerConfig) StripsClientIdentity() bool {
 	return *s.StripClientIdentity
 }
 
+// LegacyAuthCapEnabled reports whether the obsolete "AUTH=" EHLO line should
+// be advertised alongside the standard AUTH capability (default: true; see
+// the LegacyAuthCap field comment for the Outlook background).
+func (s *ServerConfig) LegacyAuthCapEnabled() bool {
+	return s.LegacyAuthCap == nil || *s.LegacyAuthCap
+}
+
 // IsTLSEnabled returns true if TLS is explicitly enabled
 func (s *ServerConfig) IsTLSEnabled() bool {
 	return s.TLS.Enabled
@@ -284,6 +371,33 @@ func (s *ServerConfig) UsesSTARTTLS() bool {
 // UsesImplicitTLS returns true if TLS mode is "implicit"
 func (s *ServerConfig) UsesImplicitTLS() bool {
 	return s.TLS.Mode == "implicit"
+}
+
+// NeedsReverseDNS reports whether this server must perform a reverse-DNS (PTR)
+// lookup on connecting clients. The lookup is uncached and runs inside
+// NewSession (again after STARTTLS re-EHLO), so on a slow or absent PTR it
+// stalls every EHLO. It is only worth that latency when something actually
+// consumes the PTR result:
+//   - require_rdns rejects connections that lack a PTR record;
+//   - a reputation PTR-hostname whitelist (whitelist_hosts) matches against it;
+//   - a sender or recipient validation URL interpolates the $ptr placeholder.
+//
+// Submission servers with none of these (the common case) skip the lookup
+// entirely.
+func (s *ServerConfig) NeedsReverseDNS() bool {
+	if s.DNSChecks.RequireRDNS {
+		return true
+	}
+	if s.Reputation.Enabled && len(s.Reputation.WhitelistHosts) > 0 {
+		return true
+	}
+	if s.SenderValidation.Enabled && strings.Contains(s.SenderValidation.URL, "$ptr") {
+		return true
+	}
+	if s.RecipientValidation.Enabled && strings.Contains(s.RecipientValidation.URL, "$ptr") {
+		return true
+	}
+	return false
 }
 
 // ApplyDefaults fills in missing values from defaults
@@ -307,6 +421,13 @@ func (s *ServerConfig) ApplyDefaults(defaults DefaultsConfig) {
 		s.MaxRecipientsPerMessage = 100
 	}
 
+	// LegacyAuthCap defaults to true for Microsoft client compatibility
+	// (uses pointer to detect unset); see the field comment.
+	if s.LegacyAuthCap == nil {
+		trueVal := true
+		s.LegacyAuthCap = &trueVal
+	}
+
 	// Apply validation defaults
 	// LoopDetection defaults to true for safety (uses pointer to detect unset)
 	if s.Validation.LoopDetection == nil {
@@ -314,10 +435,16 @@ func (s *ServerConfig) ApplyDefaults(defaults DefaultsConfig) {
 		s.Validation.LoopDetection = &trueVal
 	}
 
-	// HELOValidation defaults to true for security (uses pointer to detect unset)
+	// HELOValidation defaults by server type (uses pointer to detect unset):
+	// true on relay (MX) servers, where it screens spam bots, and false on
+	// submission servers — authenticated desktop clients (notably Windows
+	// Outlook) send their bare machine name as the EHLO argument, and
+	// rejecting it locks every such client out (the August 2026 Outlook
+	// incident). Postfix likewise never enforces HELO checks on submission.
+	// An explicit helo_validation setting wins for either type.
 	if s.HELOValidation == nil {
-		trueVal := true
-		s.HELOValidation = &trueVal
+		v := !s.IsSubmission()
+		s.HELOValidation = &v
 	}
 
 	// StripClientIdentity defaults to true on submission servers, where the client
@@ -331,12 +458,21 @@ func (s *ServerConfig) ApplyDefaults(defaults DefaultsConfig) {
 
 // RateLimitConfig holds rate limiting configuration
 type RateLimitConfig struct {
-	Enabled               bool                 `toml:"enabled"`                 // Enable rate limiting (default: true)
-	GossipEnabled         bool                 `toml:"gossip_enabled"`          // Share rate limit state across cluster via gossip (default: false)
-	GossipIntervalSeconds int                  `toml:"gossip_interval_seconds"` // How often to gossip rate limit data in seconds (default: 5)
-	WhitelistedDomains    []string             `toml:"whitelisted_domains"`     // Domains exempt from all rate limits (e.g., ["example.com", "trusted.org"])
-	WhitelistedSenders    []string             `toml:"whitelisted_senders"`     // Email addresses exempt from all rate limits (e.g., ["admin@example.com"])
-	Dimensions            []RateLimitDimension `toml:"dimensions"`              // Rate limit dimensions (e.g., IP, FROM, FROM_DOMAIN, etc.)
+	Enabled               bool `toml:"enabled"`                 // Enable rate limiting (default: true)
+	GossipEnabled         bool `toml:"gossip_enabled"`          // Share rate limit state across cluster via gossip (default: false)
+	GossipIntervalSeconds int  `toml:"gossip_interval_seconds"` // How often to gossip rate limit data in seconds (default: 5)
+	// Whitelist entries below are exempt from ALL rate limit dimensions. Each
+	// kind accepts an inline array and/or an external file (one entry per line,
+	// blank lines and '#' comments ignored); the effective set is the union of
+	// both. Files are re-read automatically when they change on disk.
+	WhitelistedIPs                 []string             `toml:"whitelisted_ips"`                   // IPs/CIDRs exempt from all rate limits (e.g., ["1.2.3.4", "10.0.0.0/8"])
+	WhitelistedDomains             []string             `toml:"whitelisted_domains"`               // Sender domains exempt from all rate limits (e.g., ["example.com", "trusted.org"])
+	WhitelistedSenders             []string             `toml:"whitelisted_senders"`               // Sender addresses exempt from all rate limits (e.g., ["admin@example.com"])
+	WhitelistedIPsFile             string               `toml:"whitelisted_ips_file"`              // Optional file of IPs/CIDRs, merged with whitelisted_ips and hot-reloaded
+	WhitelistedDomainsFile         string               `toml:"whitelisted_domains_file"`          // Optional file of sender domains, merged with whitelisted_domains and hot-reloaded
+	WhitelistedSendersFile         string               `toml:"whitelisted_senders_file"`          // Optional file of sender addresses, merged with whitelisted_senders and hot-reloaded
+	WhitelistReloadIntervalSeconds int                  `toml:"whitelist_reload_interval_seconds"` // How often to check whitelist files for changes, in seconds (default: 10)
+	Dimensions                     []RateLimitDimension `toml:"dimensions"`                        // Rate limit dimensions (e.g., IP, FROM, FROM_DOMAIN, etc.)
 }
 
 // RateLimitDimension defines a single rate limit dimension with configurable key combination
@@ -536,7 +672,7 @@ func DefaultConfig() Config {
 		Defaults: DefaultsConfig{
 			Hostname:               "mail.example.com",
 			MaxMessageSize:         25 * 1024 * 1024, // 25MB
-			TimeoutSeconds:         10,
+			TimeoutSeconds:         300,              // RFC 5321 §4.5.3.2.7 server minimum
 			ShutdownTimeoutSeconds: 60,
 			MaxConnections:         100,
 		},

@@ -7,6 +7,7 @@ import (
 	"migadu/mizu/pkg/cluster"
 	"migadu/mizu/pkg/concurrency"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 )
@@ -26,6 +27,8 @@ const (
 	AuthRateLimitEventBlockIP         AuthRateLimitEventType = "BLOCK_IP"
 	AuthRateLimitEventUnblockIP       AuthRateLimitEventType = "UNBLOCK_IP"
 	AuthRateLimitEventFailureCount    AuthRateLimitEventType = "FAILURE_COUNT"
+	AuthRateLimitEventBlockSubnet     AuthRateLimitEventType = "BLOCK_SUBNET"
+	AuthRateLimitEventUnblockSubnet   AuthRateLimitEventType = "UNBLOCK_SUBNET"
 	AuthRateLimitEventUsernameFailure AuthRateLimitEventType = "USERNAME_FAILURE"
 	AuthRateLimitEventUsernameSuccess AuthRateLimitEventType = "USERNAME_SUCCESS"
 )
@@ -47,6 +50,10 @@ type AuthRateLimitEvent struct {
 
 	// For USERNAME_* events
 	Username string
+
+	// For *_SUBNET events (gob tolerates the field being absent on old nodes,
+	// and old nodes drop the unknown event types with a warn)
+	Subnet string
 }
 
 // ClusterAuthRateLimiter handles cluster synchronization for auth rate limiting
@@ -116,6 +123,33 @@ func (c *ClusterAuthRateLimiter) BroadcastFailureCount(ip string, failureCount i
 		FirstFailure: firstFailure,
 		Timestamp:    time.Now(),
 		NodeID:       c.nodeID,
+	}
+
+	c.queueEvent(event)
+}
+
+// BroadcastBlockSubnet broadcasts a subnet block event
+func (c *ClusterAuthRateLimiter) BroadcastBlockSubnet(subnet string, blockedUntil time.Time, failureCount int, firstFailure time.Time) {
+	event := AuthRateLimitEvent{
+		Type:         AuthRateLimitEventBlockSubnet,
+		Subnet:       subnet,
+		BlockedUntil: blockedUntil,
+		FailureCount: failureCount,
+		FirstFailure: firstFailure,
+		Timestamp:    time.Now(),
+		NodeID:       c.nodeID,
+	}
+
+	c.queueEvent(event)
+}
+
+// BroadcastUnblockSubnet broadcasts a subnet unblock event
+func (c *ClusterAuthRateLimiter) BroadcastUnblockSubnet(subnet string) {
+	event := AuthRateLimitEvent{
+		Type:      AuthRateLimitEventUnblockSubnet,
+		Subnet:    subnet,
+		Timestamp: time.Now(),
+		NodeID:    c.nodeID,
 	}
 
 	c.queueEvent(event)
@@ -204,6 +238,12 @@ func (c *ClusterAuthRateLimiter) HandleClusterEvent(data []byte) {
 	case AuthRateLimitEventFailureCount:
 		c.limiter.ApplyFailureCount(event.IP, event.FailureCount, event.LastDelay, event.FirstFailure)
 
+	case AuthRateLimitEventBlockSubnet:
+		c.limiter.ApplyBlockSubnet(event.Subnet, event.BlockedUntil, event.FailureCount, event.FirstFailure)
+
+	case AuthRateLimitEventUnblockSubnet:
+		c.limiter.ApplyUnblockSubnet(event.Subnet)
+
 	case AuthRateLimitEventUsernameFailure:
 		c.limiter.ApplyUsernameFailure(event.Username, event.FailureCount, event.FirstFailure)
 
@@ -222,6 +262,11 @@ func (c *ClusterAuthRateLimiter) sanitizeEvent(event *AuthRateLimitEvent) bool {
 	case AuthRateLimitEventBlockIP, AuthRateLimitEventUnblockIP, AuthRateLimitEventFailureCount:
 		if net.ParseIP(event.IP) == nil {
 			c.logger.Warn("dropping auth rate limit event with invalid IP", "type", event.Type, "ip", event.IP)
+			return false
+		}
+	case AuthRateLimitEventBlockSubnet, AuthRateLimitEventUnblockSubnet:
+		if !validGossipSubnet(event.Subnet) {
+			c.logger.Warn("dropping auth rate limit event with invalid subnet", "type", event.Type, "subnet", event.Subnet)
 			return false
 		}
 	case AuthRateLimitEventUsernameFailure, AuthRateLimitEventUsernameSuccess:
@@ -248,6 +293,28 @@ func (c *ClusterAuthRateLimiter) sanitizeEvent(event *AuthRateLimitEvent) bool {
 	}
 
 	return true
+}
+
+// validGossipSubnet bounds the blast radius a peer can claim: the prefix must
+// parse, be in canonical (masked) form, and be no broader than a /16 (v4) or
+// /32 (v6) — gossip must never be able to block half the internet — and no
+// narrower than a single member identity, where per-IP events are the honest
+// vocabulary. Deliberately NOT an equality check against this node's own
+// configured prefix length: nodes may briefly disagree during a config
+// rollout, and a /23 from a peer is still a legitimate, bounded block.
+func validGossipSubnet(subnet string) bool {
+	prefix, err := netip.ParsePrefix(subnet)
+	if err != nil {
+		return false
+	}
+	if prefix.Masked() != prefix {
+		return false
+	}
+	bits := prefix.Bits()
+	if prefix.Addr().Is4() {
+		return bits >= 16 && bits < 32
+	}
+	return bits >= 32 && bits <= ipv6MemberBits
 }
 
 // broadcastRoutine periodically broadcasts queued events

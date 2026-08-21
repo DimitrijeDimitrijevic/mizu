@@ -37,6 +37,34 @@ func isLocalhostURL(rawURL string) bool {
 	return false
 }
 
+// ParseIPList parses IP whitelist entries into networks. Each entry is either
+// an exact IP ("1.2.3.4", "2001:db8::1") or a CIDR ("10.0.0.0/8"); exact IPs
+// become single-address networks.
+func ParseIPList(entries []string) ([]*net.IPNet, error) {
+	nets := make([]*net.IPNet, 0, len(entries))
+	for _, entry := range entries {
+		if strings.Contains(entry, "/") {
+			_, ipNet, err := net.ParseCIDR(entry)
+			if err != nil {
+				return nil, fmt.Errorf("invalid CIDR %q", entry)
+			}
+			nets = append(nets, ipNet)
+			continue
+		}
+		ip := net.ParseIP(entry)
+		if ip == nil {
+			return nil, fmt.Errorf("invalid IP address %q", entry)
+		}
+		mask := net.CIDRMask(128, 128)
+		if ip4 := ip.To4(); ip4 != nil {
+			ip = ip4
+			mask = net.CIDRMask(32, 32)
+		}
+		nets = append(nets, &net.IPNet{IP: ip, Mask: mask})
+	}
+	return nets, nil
+}
+
 // Validate checks the configuration for required fields and placeholder values.
 func (c *Config) Validate() error {
 	// Check that at least one server is configured
@@ -72,6 +100,18 @@ func (c *Config) Validate() error {
 		c.Servers[i].ApplyDefaults(c.Defaults)
 		if err := c.Servers[i].Validate(); err != nil {
 			return fmt.Errorf("server '%s': %w", c.Servers[i].Name, err)
+		}
+
+		// Validate the effective max message size (defaults already applied, so
+		// this covers a per-server override and an inherited defaults value
+		// alike). A zero ("unlimited") limit is a memory-DoS foot-gun — the whole
+		// message is buffered in RAM per session and again per recipient during
+		// delivery — so it is rejected outright, and a ceiling caps the blast
+		// radius of a misconfigured large limit.
+		if size := c.Servers[i].MaxMessageSize; size <= 0 {
+			return fmt.Errorf("server '%s': max_message_size must be a positive byte limit - messages are buffered in memory, \"unlimited\" (0) is not supported", c.Servers[i].Name)
+		} else if size > MaxMessageSizeLimit {
+			return fmt.Errorf("server '%s': max_message_size must be <= %d MiB (got %d bytes)", c.Servers[i].Name, MaxMessageSizeLimit/(1024*1024), size)
 		}
 	}
 
@@ -290,6 +330,17 @@ func (s *ServerConfig) Validate() error {
 		}
 	}
 
+	// Parse IP whitelists once; the server backend reads the parsed networks
+	// via the accessors, so a typo in any list fails startup instead of
+	// silently never matching.
+	var err error
+	if s.DNSChecks.rdnsWhitelistNets, err = ParseIPList(s.DNSChecks.RDNSWhitelistIPs); err != nil {
+		return fmt.Errorf("dns_checks.rdns_whitelist_ips: %w", err)
+	}
+	if s.Reputation.whitelistNets, err = ParseIPList(s.Reputation.WhitelistIPs); err != nil {
+		return fmt.Errorf("reputation.whitelist_ips: %w", err)
+	}
+
 	// Validate Junk config
 	if s.Junk.ApplyAction != "" {
 		if s.Junk.ApplyAction != "header" && s.Junk.ApplyAction != "reject" && s.Junk.ApplyAction != "warn" && s.Junk.ApplyAction != "subject" {
@@ -325,13 +376,8 @@ func (s *ServerConfig) Validate() error {
 	if !s.ProxyProtocol && len(s.ProxyProtocolTrusted) > 0 {
 		return errors.New("proxy_protocol_trusted is set but proxy_protocol is not enabled")
 	}
-	for _, cidr := range s.ProxyProtocolTrusted {
-		if _, _, err := net.ParseCIDR(cidr); err != nil {
-			// Try as plain IP
-			if net.ParseIP(cidr) == nil {
-				return fmt.Errorf("proxy_protocol_trusted: invalid CIDR or IP %q", cidr)
-			}
-		}
+	if s.proxyTrustedNets, err = ParseIPList(s.ProxyProtocolTrusted); err != nil {
+		return fmt.Errorf("proxy_protocol_trusted: %w", err)
 	}
 
 	// Validate distributed tracking
@@ -362,6 +408,13 @@ func (s *ServerConfig) Validate() error {
 		if usable == 0 {
 			return errors.New("rate_limit.enabled=true but no dimension has a positive limit - rate limiting would enforce nothing (set at least one dimension with limit > 0, or disable rate limiting)")
 		}
+	}
+
+	// Validate inline rate-limit IP whitelist entries so typos fail fast at
+	// startup. File-sourced entries are validated leniently at load/reload time
+	// (bad lines are skipped and logged) so a running server survives a bad edit.
+	if _, err := ParseIPList(s.RateLimit.WhitelistedIPs); err != nil {
+		return fmt.Errorf("rate_limit.whitelisted_ips: %w", err)
 	}
 
 	// Validate recipient validation config (HTTPS scheme is enforced in

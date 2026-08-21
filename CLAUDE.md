@@ -89,6 +89,12 @@ Key packages:
    - 5-minute authentication cache to reduce API calls
    - Validates that authenticated users can only send from authorized addresses
    - Adds `X-Auth-User` header to delivery for authenticated messages
+   - `AuthRateLimiter` ([pkg/smtp/auth_rate_limiter.go](pkg/smtp/auth_rate_limiter.go)) blocks brute force in three tiers, configured under `[server.auth.rate_limit]`:
+     - Tier 1 (IP+username), Tier 2 (IP-only), Tier 3 (subnet, [pkg/smtp/auth_subnet.go](pkg/smtp/auth_subnet.go))
+     - Tier 3 catches attackers rotating through sibling IPs, which never accumulate under tiers 1-2. It triggers on **breadth** (distinct failing addresses in a subnet: `subnet_max_distinct_ips`, default 8), not volume, so a shared NAT does not qualify. IPv4 groups by /24, IPv6 counts distinct /64s inside a /48
+     - Every tier keys IPv6 by /64 (`bucketIP`), otherwise one allocation supplies 2^64 free identities
+     - Refusals are 454 (temporary), an address that logged in successfully within `success_exempt_duration` (default 24h) bypasses subnet blocks, and private/loopback/`subnet_exempt` ranges are never blocked
+     - Lift a subnet block with `./mizu-admin unblock-ip 203.0.113.0/24` (CIDR form); blocks and unblocks propagate over cluster gossip
 
 4. **Connection Tracking & DoS Protection** ([pkg/smtp/](pkg/smtp/))
    - `ConnectionTracker`: Local per-IP and global connection limits
@@ -171,12 +177,23 @@ Key packages:
   // Response (user found)
   {
     "password_hashes": ["$2a$10$...", "$2a$10$..."],  // Array of password hashes (bcrypt, SSHA512, SHA512)
-    "allowed_from": ["user@example.com", "alias@example.com"]
+    "allowed_from": ["user@example.com", "alias@example.com", "*@team.example.com", "/^user\\+.*@example.com/"]
   }
 
   // Response (user not found)
   404 Not Found
+
+  // Response (user denied submission — e.g. rcptd deny_smtp list)
+  403 Forbidden
   ```
+- Auth-backend status semantics: **200** = verify the returned hashes locally;
+  **404** = user unknown (AUTH rejected); **403** = user denied submission,
+  treated as a definitive AUTH failure exactly like 404 (not a transient/backend
+  error, so the client is rejected rather than told to retry); any other status =
+  backend error
+- `allowed_from` entries may be exact addresses, `*@domain` wildcards, or
+  `/regex/` patterns (rcptd's regex_sender_login pass-through, matched
+  case-insensitively against MAIL FROM with substring semantics like Postfix pcre)
 - Password verification happens **locally** (never send passwords over network)
 - Supports multiple password hashes per user (tries all until one matches)
 - URL supports `$email` and `$ip` placeholders for interpolation
@@ -199,6 +216,16 @@ Key packages:
 - For 450 status code, response body can include JSON `{"message": "custom text", "temporary": true}` to provide custom message for temporary failure
 - Successful validations cached for 5 minutes (configurable)
 - Provides early rejection before DATA phase, reducing bandwidth and processing
+
+**DNS Checks Configuration:**
+- `[server.dns_checks]` section controls connection-time DNS validation
+- `require_rdns`: Reject connections whose IP has no PTR (reverse DNS) record
+- `rdns_whitelist_ips`: IPs/CIDRs exempt from `require_rdns` (e.g., `["1.2.3.4", "10.0.0.0/8"]` for monitoring probes or internal hosts)
+  - Exempts only the rDNS requirement — reputation checks still apply (use `reputation.whitelist_ips` to bypass those)
+  - Entries are validated at startup; invalid IPs/CIDRs fail config validation
+  - Sessions admitted without a PTR record interpolate `$ptr` as an empty string in sender/recipient validation URLs
+- `require_sender_mx`: Require sender domain to have MX records
+- `require_resolvable_helo`: Require HELO hostname to have DNS records
 
 ### Storage Backend Configuration
 
@@ -299,10 +326,17 @@ telnet localhost 25
 - Multi-dimensional: Can combine keys (IP, FROM, FROM_DOMAIN, TO, TO_DOMAIN, AUTHENTICATED_USER)
 - Sliding window algorithm
 - Gossip-based cluster-wide enforcement (optional)
-- Whitelist support: Domains and senders can be exempted from all rate limits
-  - `whitelisted_domains`: Entire domains bypass rate limits (e.g., ["trusted.com"])
-  - `whitelisted_senders`: Specific email addresses bypass rate limits (e.g., ["admin@example.com"])
-  - Case-insensitive matching
+- Whitelist support: IPs, domains, and senders can be exempted from ALL rate limit dimensions
+  - `whitelisted_ips`: IPs/CIDRs bypass rate limits (e.g., ["1.2.3.4", "10.0.0.0/8"])
+  - `whitelisted_domains`: Entire sender domains bypass rate limits (e.g., ["trusted.com"])
+  - `whitelisted_senders`: Specific sender addresses bypass rate limits (e.g., ["admin@example.com"])
+  - Case-insensitive matching (domains/senders)
+  - **External files + hot reload**: each kind also accepts a file path — `whitelisted_ips_file`,
+    `whitelisted_domains_file`, `whitelisted_senders_file` (one entry per line; blank lines and
+    `#` comments ignored). File entries are unioned with the inline arrays and re-read
+    automatically when the file changes on disk (`whitelist_reload_interval_seconds`, default 10).
+    A missing/unreadable file logs a warning and is treated as empty until it appears.
+    Implementation: [pkg/smtp/rate_limit_whitelist.go](pkg/smtp/rate_limit_whitelist.go) (atomic snapshot swap, lock-free read path)
 - Configured via `smtp.rate_limit.dimensions` array
 
 ## Workflow Orchestration
@@ -440,10 +474,12 @@ deliveryCfg := serverCfg.Delivery
   - `hashicorp/memberlist` - Distributed cluster coordination
   - `aws/aws-sdk-go-v2` - S3 client (certs and stats sync)
   - `prometheus/client_golang` - Metrics
-  - `shared` (local module, `replace shared => ../shared`) - password hash
-    verification (`shared/passwd`), shared with rcptd/rcptctl. Building mizu
-    requires the sibling `../shared` checkout from the ansible-freebsd3 tree;
-    the Ansible build task provides it next to the clone in `.compile/`.
+  - `github.com/migadu/passwd` (local module, `replace github.com/migadu/passwd
+    => ../passwd`) - password hash verification, shared with rcptd/rcptctl and
+    calserver. Building mizu requires the sibling `../passwd` checkout from the
+    ansible-freebsd3 tree; the Ansible build task provides it next to the clone
+    in `.compile/`. (This and `github.com/migadu/emailutil` replaced the former
+    single `shared` module, now split into one module per package.)
 
 ## Version Information
 

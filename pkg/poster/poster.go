@@ -57,6 +57,13 @@ func NewHTTPClient(timeout time.Duration, maxIdleConnsPerHost, maxConnsPerHost i
 	return &http.Client{
 		Timeout:   timeout,
 		Transport: transport,
+		// A delivery endpoint has no legitimate redirect use. Stop at the first
+		// response instead of following 3xx, which could re-route the message
+		// body (Go only strips the Authorization header on cross-host redirects,
+		// so the message itself would still be forwarded wherever pointed).
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 }
 

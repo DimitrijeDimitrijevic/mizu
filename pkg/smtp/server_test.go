@@ -169,16 +169,21 @@ func TestSessionTimeoutConstants(t *testing.T) {
 		t.Error("IdleTimeout should be positive")
 	}
 
-	if DataTimeout <= 0 {
-		t.Error("DataTimeout should be positive")
+	if DataBlockTimeout <= 0 {
+		t.Error("DataBlockTimeout should be positive")
 	}
 
 	// Verify ordering (session > data > command > idle)
-	if SessionDeadline <= DataTimeout {
-		t.Error("SessionDeadline should be greater than DataTimeout")
+	if DataBlockTimeout <= ProcessingTimeout {
+		t.Error("DataBlockTimeout should be greater than ProcessingTimeout")
 	}
 
-	if DataTimeout <= ProcessingTimeout {
-		t.Error("DataTimeout should be greater than ProcessingTimeout")
+	// A session must be able to receive a full-size message over a slow link
+	// and still have its delivery retry window inside SessionDeadline, which
+	// bounds the delivery context. Several DATA blocks' worth of headroom is
+	// the floor; anything tighter rejects healthy mail from slow uplinks.
+	if SessionDeadline <= 4*DataBlockTimeout {
+		t.Errorf("SessionDeadline (%v) leaves too little room above DataBlockTimeout (%v) for a slow large message plus delivery",
+			SessionDeadline, DataBlockTimeout)
 	}
 }

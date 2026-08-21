@@ -164,6 +164,14 @@ func main() {
 				server := &http.Server{
 					Addr:      ":443",
 					TLSConfig: tlsMgr.TLSConfig(),
+					ErrorLog:  logging.NewHTTPErrorLogger(logger, "acme-tls-alpn-01", ":443"),
+					// Bounded I/O so stalled handshakes/requests cannot pin
+					// connections (slowloris). ACME clients complete the handshake
+					// in well under a second; the challenge token is delivered
+					// during the handshake itself.
+					ReadTimeout:  10 * time.Second,
+					WriteTimeout: 10 * time.Second,
+					IdleTimeout:  30 * time.Second,
 				}
 				// Empty cert/key files - TLSConfig.GetCertificate handles everything.
 				if err := server.ListenAndServeTLS("", ""); err != nil {
@@ -174,7 +182,15 @@ func main() {
 			// Start HTTP server on port 80 for HTTP-01 challenges (fallback).
 			concurrency.SafeGo(logger, "acme-http-server", func() {
 				logger.Info("Starting HTTP server for ACME HTTP-01 challenges on :80")
-				if err := http.ListenAndServe(":80", tlsMgr.HTTPHandler()); err != nil {
+				server := &http.Server{
+					Addr:         ":80",
+					Handler:      tlsMgr.HTTPHandler(),
+					ErrorLog:     logging.NewHTTPErrorLogger(logger, "acme-http-01", ":80"),
+					ReadTimeout:  10 * time.Second,
+					WriteTimeout: 10 * time.Second,
+					IdleTimeout:  30 * time.Second,
+				}
+				if err := server.ListenAndServe(); err != nil {
 					logger.Error("HTTP-01 challenge server failed", "error", err)
 				}
 			})
@@ -735,20 +751,35 @@ func startHealthServer(cfg *config.Config, logger *slog.Logger, statsManager *st
 	// Check TLS certificates only for servers with implicit TLS (e.g. port 465).
 	// STARTTLS ports (25, 587) cannot be checked with tls.Dial - they require
 	// a plaintext SMTP greeting followed by STARTTLS upgrade.
+	// PROXY-protocol listeners are skipped: they require a PROXY header before
+	// the TLS handshake, which a direct tls.Dial can't send, so they're only
+	// reachable via HAProxy and there is nothing meaningful to probe directly.
 	if !cfg.Local {
 		for _, srv := range cfg.Servers {
+			if srv.ProxyProtocol {
+				continue
+			}
 			if srv.Hostname != "" && srv.Hostname != "mail.yourdomain.com" && srv.UsesImplicitTLS() {
-				_, portStr, err := net.SplitHostPort(srv.ListenAddr)
+				host, portStr, err := net.SplitHostPort(srv.ListenAddr)
 				if err != nil {
 					logger.Warn("Could not parse listen address for health check",
 						"server", srv.Name,
 						"error", err)
 					continue
 				}
-				port, _ := net.LookupPort("tcp", portStr)
-				if port > 0 {
-					checkers = append(checkers, health.NewCheckTLSCertificate(srv.Hostname, port, 14*24*time.Hour))
+				if port, _ := net.LookupPort("tcp", portStr); port <= 0 {
+					continue
 				}
+				// Probe this node's own listener, not the public hostname: the
+				// hostname round-robins across the cluster and its public path
+				// may be firewalled from the node itself (or lack NAT hairpin).
+				// Wildcard binds are dialed via loopback; SNI still carries the
+				// hostname so the correct cert is selected and verified.
+				if host == "" || host == "0.0.0.0" || host == "::" {
+					host = "127.0.0.1"
+				}
+				dialAddr := net.JoinHostPort(host, portStr)
+				checkers = append(checkers, health.NewCheckTLSCertificate(srv.Name, dialAddr, srv.Hostname, 14*24*time.Hour))
 			}
 		}
 	}
@@ -827,6 +858,7 @@ func startMetricsServer(cfg *config.Config, logger *slog.Logger) *http.Server {
 	server := &http.Server{
 		Addr:         bind,
 		Handler:      mux,
+		ErrorLog:     logging.NewHTTPErrorLogger(logger, "metrics", bind),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  30 * time.Second,
@@ -1000,6 +1032,22 @@ func createServerBackend(
 		if cfg.MaxUsernameEntries == 0 {
 			cfg.MaxUsernameEntries = 50000
 		}
+		if cfg.MaxSubnetEntries == 0 {
+			cfg.MaxSubnetEntries = 10000
+		}
+		// Tier 3 subnet blocking: on by default (0 = unset; negative disables).
+		if cfg.SubnetMaxDistinctIPs == 0 {
+			cfg.SubnetMaxDistinctIPs = 8
+		}
+		if cfg.SubnetMinFailures == 0 {
+			cfg.SubnetMinFailures = 15
+		}
+		if cfg.SubnetIPv4Prefix == 0 {
+			cfg.SubnetIPv4Prefix = 24
+		}
+		if cfg.SubnetIPv6Prefix == 0 {
+			cfg.SubnetIPv6Prefix = 48
+		}
 
 		// Enable auth rate limiting by default when auth is required
 		if !cfg.Enabled && serverCfg.Auth.Required {
@@ -1029,6 +1077,7 @@ func createServerBackend(
 				"max_ip_username", cfg.MaxAttemptsPerIPUsername,
 				"max_ip", cfg.MaxAttemptsPerIP,
 				"max_username", cfg.MaxAttemptsPerUsername,
+				"subnet_distinct_ips", cfg.SubnetMaxDistinctIPs,
 				"cluster_sync", cfg.ClusterSyncEnabled)
 		}
 	}
@@ -1277,6 +1326,23 @@ func initSenderValidator(serverCfg *config.ServerConfig, logger *slog.Logger) sm
 	return adapter
 }
 
+// applyEhloCompat configures EHLO capability compatibility knobs on the
+// go-smtp server from the per-server config. Kept as a separate function so
+// the config-to-server mapping is unit-testable.
+func applyEhloCompat(server *gosmtp.Server, serverCfg *config.ServerConfig) {
+	// LIMITS (RFC 9422) is suppressed unless explicitly re-enabled: the
+	// extension is young and can confuse client capability parsers.
+	server.DisableLimitsCap = !serverCfg.AdvertiseLimits
+
+	// Obsolete "AUTH=" EHLO line for Microsoft Outlook lineages, which refuse
+	// to attempt AUTH when only the RFC-conformant form is present (Postfix's
+	// broken_sasl_auth_clients; the August 2026 new-Outlook incident). Only
+	// meaningful on submission servers, where AUTH is advertised.
+	if serverCfg.IsSubmission() {
+		server.EnableLegacyAuthCap = serverCfg.LegacyAuthCapEnabled()
+	}
+}
+
 // runSMTPServerInstance runs a single SMTP server instance
 func runSMTPServerInstance(ctx context.Context, serverCfg *config.ServerConfig, be *smtp.Backend, tlsConfig *tls.Config, logger *slog.Logger, successCounter *atomic.Int32) {
 	server := gosmtp.NewServer(be)
@@ -1287,6 +1353,7 @@ func runSMTPServerInstance(ctx context.Context, serverCfg *config.ServerConfig, 
 	server.MaxMessageBytes = int64(serverCfg.MaxMessageSize)
 	server.EnableSMTPUTF8 = true
 	server.MaxRecipients = serverCfg.MaxRecipientsPerMessage
+	applyEhloCompat(server, serverCfg)
 
 	// Enable debug logging if configured
 	if serverCfg.Debug {
@@ -1390,20 +1457,8 @@ func runSMTPServerInstance(ctx context.Context, serverCfg *config.ServerConfig, 
 
 	// Wrap with PROXY protocol listener if enabled
 	if serverCfg.ProxyProtocol {
-		// Build trusted subnet list for policy enforcement
-		var trustedNets []*net.IPNet
-		for _, entry := range serverCfg.ProxyProtocolTrusted {
-			if _, cidr, err := net.ParseCIDR(entry); err == nil {
-				trustedNets = append(trustedNets, cidr)
-			} else if ip := net.ParseIP(entry); ip != nil {
-				// Convert single IP to /32 or /128
-				bits := 32
-				if ip.To4() == nil {
-					bits = 128
-				}
-				trustedNets = append(trustedNets, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
-			}
-		}
+		// Trusted subnet list for policy enforcement, parsed by config.Validate
+		trustedNets := serverCfg.ProxyTrustedNets()
 
 		listener = &proxyproto.Listener{
 			Listener: listener,

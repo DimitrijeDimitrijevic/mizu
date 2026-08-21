@@ -12,7 +12,7 @@ import (
 	"migadu/mizu/pkg/config"
 	"migadu/mizu/pkg/smtp"
 
-	"shared/passwd"
+	"github.com/migadu/passwd"
 )
 
 // Auth exit codes. Operational failures (flag parse, config load, transport,
@@ -22,6 +22,7 @@ const (
 	exitAuthOK       = 0 // password matched, or (no password) user found
 	exitAuthNoMatch  = 2 // user found but password did not match
 	exitAuthNotFound = 3 // user unknown (404 from the auth backend)
+	exitAuthDenied   = 4 // user denied submission (403 from the auth backend)
 )
 
 // cmdAuth implements `mizu-admin auth [flags] <email> [password]`.
@@ -29,7 +30,7 @@ const (
 // It resolves the SMTP AUTH backend URL (rcptd's /auth) from the Mizu config —
 // the exact endpoint Mizu queries during SMTP AUTH — fetches the user's password
 // hashes and allowed_from list, and, if a password is supplied, verifies it
-// locally via shared/passwd (the same implementation Mizu uses at auth time,
+// locally via migadu/passwd (the same implementation Mizu uses at auth time,
 // covering bcrypt/BLF-CRYPT/SSHA512/SHA512). The plaintext password is never
 // sent to the backend.
 func cmdAuth() {
@@ -107,6 +108,20 @@ func cmdAuth() {
 			fmt.Printf("NOT FOUND %s\n", email)
 		}
 		os.Exit(exitAuthNotFound)
+	}
+	if status == http.StatusForbidden {
+		// The backend denies submission for this user (rcptd deny_smtp); Mizu
+		// rejects the AUTH exactly as it does for an unknown user.
+		if *jsonOut {
+			var extra map[string]any
+			if havePassword {
+				extra = map[string]any{"password_match": false}
+			}
+			emitAuthJSON(email, nil, nil, "denied", status, extra)
+		} else {
+			fmt.Printf("DENIED    %s\n", email)
+		}
+		os.Exit(exitAuthDenied)
 	}
 	if status != http.StatusOK {
 		fatal("auth backend returned HTTP %d: %s", status, strings.TrimSpace(string(body)))

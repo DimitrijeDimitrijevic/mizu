@@ -37,9 +37,9 @@ func NewAdapter(client *Client, spamHeader, spamHeaderValue, hamHeaderValue, rej
 }
 
 // Check performs spam checking and returns result
-func (a *Adapter) Check(ctx context.Context, traceID, message, clientIP, from string, rcpt []string, helo string) (smtp.SpamCheckResult, error) {
+func (a *Adapter) Check(ctx context.Context, traceID, message, clientIP, from string, rcpt []string, helo, authenticatedUser string) (smtp.SpamCheckResult, error) {
 	// Call rspamd
-	result, err := a.client.Check(ctx, traceID, message, clientIP, from, rcpt, helo)
+	result, err := a.client.Check(ctx, traceID, message, clientIP, from, rcpt, helo, authenticatedUser)
 	if err != nil {
 		return smtp.SpamCheckResult{}, err
 	}
@@ -47,10 +47,11 @@ func (a *Adapter) Check(ctx context.Context, traceID, message, clientIP, from st
 	// Copy so we can add the configured spam/ham header without mutating
 	// the rspamd result.
 	adapterResult := smtp.SpamCheckResult{
-		IsSpam:     result.IsSpam,
-		Action:     result.Action,
-		Score:      result.Score,
-		AddHeaders: make(map[string][]string, len(result.AddHeaders)+1),
+		IsSpam:      result.IsSpam,
+		Action:      result.Action,
+		Score:       result.Score,
+		SMTPMessage: result.SMTPMessage,
+		AddHeaders:  make(map[string][]string, len(result.AddHeaders)+1),
 	}
 	maps.Copy(adapterResult.AddHeaders, result.AddHeaders)
 

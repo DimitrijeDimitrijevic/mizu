@@ -33,7 +33,7 @@ func (w *LogWriter) Reopen() error {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	newFile, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	newFile, err := openLogFile(w.path)
 	if err != nil {
 		return fmt.Errorf("reopen log file %s: %w", w.path, err)
 	}
@@ -100,6 +100,25 @@ func parseLogLevel(level string) (slog.Level, error) {
 	}
 }
 
+// logFileMode is the permission for log files. Logs carry envelope addresses,
+// sender IPs, usernames and hostnames (PII), so they are private to the
+// service user.
+const logFileMode = 0o600
+
+// openLogFile opens (creating if needed) a log file with restrictive
+// permissions. The mode argument of OpenFile only applies at creation, so the
+// explicit Chmod also tightens files pre-created with looser modes by the
+// rotation tool (newsyslog creates the new file before sending SIGHUP).
+// Best effort: a Chmod failure (unusual filesystems) is not fatal.
+func openLogFile(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, logFileMode)
+	if err != nil {
+		return nil, err
+	}
+	_ = f.Chmod(logFileMode)
+	return f, nil
+}
+
 func newLogWriter(output string) (*LogWriter, error) {
 	switch strings.ToLower(output) {
 	case "stderr":
@@ -109,7 +128,7 @@ func newLogWriter(output string) (*LogWriter, error) {
 	case "syslog", "":
 		return &LogWriter{file: os.Stderr}, nil
 	default:
-		file, err := os.OpenFile(output, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		file, err := openLogFile(output)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open log file %s: %w", output, err)
 		}

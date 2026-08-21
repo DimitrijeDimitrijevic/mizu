@@ -94,8 +94,11 @@
 //  2. Wait for active sessions to complete (ActiveSessionsWg)
 //  3. Close listeners
 //
-// Active sessions have a maximum lifetime (SessionDeadline = 5 minutes)
-// to prevent indefinite hangs during shutdown.
+// Active sessions have a bounded lifetime (SessionDeadline, restarted on each
+// completed transaction) to prevent indefinite hangs during shutdown. A session
+// that stops making progress is dropped much sooner: the wait for the next
+// command is bounded by timeout_seconds and a stall inside the message body by
+// DataBlockTimeout.
 //
 // # Thread Safety
 //

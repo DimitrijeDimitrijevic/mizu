@@ -132,7 +132,7 @@ Commands:
   tls                Manage TLS certificates (list, delete, clean, sync)
   renew-cert         Force certificate renewal for a domain
   flush-cache        Flush recipient and IP block caches
-  unblock-ip         Remove a specific IP from the reputation tracker
+  unblock-ip         Remove an IP (or, in CIDR form, a blocked subnet) from tracking
   auth               Check a username/password against the SMTP AUTH backend
   version            Show version information
 
@@ -625,55 +625,66 @@ func cmdCerts() {
 		fatal("Failed to parse health response: %v", err)
 	}
 
-	// Look for TLS certificate component
-	certComp, ok := health.Components["tls_certificate"]
-	if !ok {
+	// Look for TLS certificate components (one per implicit-TLS server,
+	// named "tls_certificate:<server>").
+	names := make([]string, 0, len(health.Components))
+	for name := range health.Components {
+		if strings.HasPrefix(name, "tls_certificate") {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
 		fmt.Println("No TLS certificate information available")
 		fmt.Println("(Server may be running in local mode)")
 		return
 	}
+	sort.Strings(names)
 
 	fmt.Println("TLS Certificate Status")
 	fmt.Println("======================")
-	fmt.Println()
 
-	statusIcon := "✓"
-	switch certComp.Status {
-	case "unhealthy":
-		statusIcon = "✗"
-	case "degraded":
-		statusIcon = "⚠"
-	}
+	for _, name := range names {
+		certComp := health.Components[name]
 
-	fmt.Printf("Status: %s %s\n\n", statusIcon, strings.ToUpper(certComp.Status))
+		statusIcon := "✓"
+		switch certComp.Status {
+		case "unhealthy":
+			statusIcon = "✗"
+		case "degraded":
+			statusIcon = "⚠"
+		}
 
-	if certComp.Details != nil {
-		details, ok := certComp.Details.(map[string]any)
-		if ok {
-			if subject, ok := details["subject"].(string); ok {
-				fmt.Printf("Subject:          %s\n", subject)
-			}
-			if issuer, ok := details["issuer"].(string); ok {
-				fmt.Printf("Issuer:           %s\n", issuer)
-			}
-			if validFrom, ok := details["valid_from"].(string); ok {
-				fmt.Printf("Valid From:       %s\n", validFrom)
-			}
-			if validUntil, ok := details["valid_until"].(string); ok {
-				fmt.Printf("Valid Until:      %s\n", validUntil)
-			}
-			if days, ok := details["days_until_expiry"].(float64); ok {
-				daysInt := int(days)
-				fmt.Printf("Days Until Expiry: %d", daysInt)
-				if daysInt < 7 {
-					fmt.Printf(" ⚠️  CRITICAL - Renew soon!")
-				} else if daysInt < 30 {
-					fmt.Printf(" ⚠️  Warning")
+		server := strings.TrimPrefix(name, "tls_certificate:")
+		fmt.Printf("\n%s %s  Status: %s\n\n", statusIcon, server, strings.ToUpper(certComp.Status))
+
+		if certComp.Details != nil {
+			details, ok := certComp.Details.(map[string]any)
+			if ok {
+				if subject, ok := details["subject"].(string); ok {
+					fmt.Printf("Subject:          %s\n", subject)
 				}
-				fmt.Println()
-			}
-			if errorMsg, ok := details["error"].(string); ok {
-				fmt.Printf("\nError: %s\n", errorMsg)
+				if issuer, ok := details["issuer"].(string); ok {
+					fmt.Printf("Issuer:           %s\n", issuer)
+				}
+				if validFrom, ok := details["valid_from"].(string); ok {
+					fmt.Printf("Valid From:       %s\n", validFrom)
+				}
+				if validUntil, ok := details["valid_until"].(string); ok {
+					fmt.Printf("Valid Until:      %s\n", validUntil)
+				}
+				if days, ok := details["days_until_expiry"].(float64); ok {
+					daysInt := int(days)
+					fmt.Printf("Days Until Expiry: %d", daysInt)
+					if daysInt < 7 {
+						fmt.Printf(" ⚠️  CRITICAL - Renew soon!")
+					} else if daysInt < 30 {
+						fmt.Printf(" ⚠️  Warning")
+					}
+					fmt.Println()
+				}
+				if errorMsg, ok := details["error"].(string); ok {
+					fmt.Printf("\nError: %s\n", errorMsg)
+				}
 			}
 		}
 	}
@@ -767,12 +778,16 @@ func cmdFlushCache() {
 
 func cmdUnblockIP() {
 	if flag.NArg() < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: mizu-admin unblock-ip <ip-address>\n")
+		fmt.Fprintf(os.Stderr, "Usage: mizu-admin unblock-ip <ip-address|cidr>\n")
 		os.Exit(1)
 	}
 	ip := flag.Arg(1)
+	// CIDR notation lifts a subnet block from the auth rate limiter; a plain
+	// address unblocks that address.
 	if net.ParseIP(ip) == nil {
-		fatal("Invalid IP address: %s", ip)
+		if _, _, err := net.ParseCIDR(ip); err != nil {
+			fatal("Invalid IP address or CIDR: %s", ip)
+		}
 	}
 
 	bodyJSON, _ := json.Marshal(map[string]string{"ip": ip})

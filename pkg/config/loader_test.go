@@ -321,6 +321,16 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Storage.S3Region != "us-east-1" {
 		t.Errorf("Storage.S3Region = %s; want us-east-1", cfg.Storage.S3Region)
 	}
+
+	// The command timeout becomes go-smtp's ReadTimeout, which is re-armed
+	// before every command read — it is the real "how long may a client pause"
+	// budget, including the pause before the first EHLO. RFC 5321 §4.5.3.2.7
+	// puts the floor at 5 minutes; below that, MUAs that stall between commands
+	// (e.g. a slow reverse-DNS lookup of their own LAN address) get a
+	// "421 4.4.2 Idle timeout" and report a broken connection.
+	if cfg.Defaults.TimeoutSeconds < 300 {
+		t.Errorf("Defaults.TimeoutSeconds = %d; want >= 300 (RFC 5321 §4.5.3.2.7)", cfg.Defaults.TimeoutSeconds)
+	}
 }
 
 func TestExpandEnvRefs(t *testing.T) {
@@ -651,4 +661,73 @@ func TestStripClientIdentity_Defaults(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestValidateConfig_MaxMessageSize(t *testing.T) {
+	baseCfg := func(size int) Config {
+		cfg := DefaultConfig()
+		cfg.Local = true
+		cfg.Storage.Backend = "filesystem"
+		cfg.Storage.FilesystemPath = "/tmp/mizu"
+		cfg.Servers = []ServerConfig{
+			{
+				Name:       "relay",
+				Type:       "relay",
+				ListenAddr: ":25",
+				Hostname:   "test.example.com",
+				Delivery: DeliveryConfig{
+					URL:                "https://test.com",
+					AuthToken:          "test-token",
+					MaxRetryAttempts:   3,
+					HTTPTimeoutSeconds: 30,
+				},
+			},
+		}
+		if size > 0 {
+			cfg.Servers[0].MaxMessageSize = size
+		}
+		return cfg
+	}
+
+	t.Run("default applies and passes", func(t *testing.T) {
+		cfg := baseCfg(0)
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("expected no error with default size, got: %v", err)
+		}
+	})
+
+	t.Run("unset per-server inherits safe default", func(t *testing.T) {
+		// A per-server 0 (or unset) means "inherit from defaults"; with the
+		// standard 25 MiB default this is safe and must pass.
+		cfg := baseCfg(1)
+		cfg.Servers[0].MaxMessageSize = 0
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("expected inherited default to pass, got: %v", err)
+		}
+	})
+
+	t.Run("unlimited defaults inherited rejected", func(t *testing.T) {
+		cfg := baseCfg(1)
+		cfg.Servers[0].MaxMessageSize = 0 // inherit from defaults
+		cfg.Defaults.MaxMessageSize = 0   // explicitly unlimited defaults
+		err := cfg.Validate()
+		if err == nil || !contains(err.Error(), "max_message_size") {
+			t.Errorf("expected max_message_size error, got: %v", err)
+		}
+	})
+
+	t.Run("oversized limit rejected", func(t *testing.T) {
+		cfg := baseCfg(MaxMessageSizeLimit + 1)
+		err := cfg.Validate()
+		if err == nil || !contains(err.Error(), "max_message_size") {
+			t.Errorf("expected max_message_size error, got: %v", err)
+		}
+	})
+
+	t.Run("ceiling accepted", func(t *testing.T) {
+		cfg := baseCfg(MaxMessageSizeLimit)
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("expected no error at ceiling, got: %v", err)
+		}
+	})
 }

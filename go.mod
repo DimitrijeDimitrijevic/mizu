@@ -15,6 +15,7 @@ require (
 	github.com/emersion/go-smtp v0.21.3
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/hashicorp/memberlist v0.5.3
+	github.com/migadu/passwd v0.0.0-20260815055905-ea3ab9a0a7d0
 	github.com/migadu/spf v1.0.0
 	github.com/pires/go-proxyproto v0.12.0
 	github.com/prometheus/client_golang v1.23.2
@@ -23,7 +24,7 @@ require (
 	golang.org/x/net v0.55.0
 )
 
-replace github.com/emersion/go-smtp => github.com/migadu/go-smtp v0.0.0-20260705092127-a9ff9fa2a2bb
+replace github.com/emersion/go-smtp => github.com/migadu/go-smtp v0.0.0-20260815141737-8c80850aaeaf
 
 require (
 	github.com/armon/go-metrics v0.4.1 // indirect
@@ -67,9 +68,6 @@ require (
 	golang.org/x/text v0.38.0 // indirect
 	golang.org/x/tools v0.45.0 // indirect
 	google.golang.org/protobuf v1.36.8 // indirect
-	shared v0.0.0
 )
-
-replace shared => ../shared
 
 replace github.com/emersion/go-message => github.com/migadu/go-message v0.0.0-20250216181611-b9039e0d248f
