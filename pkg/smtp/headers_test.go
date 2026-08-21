@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"migadu/mizu/pkg/config"
 	"migadu/mizu/pkg/validation"
 
 	"github.com/emersion/go-msgauth/authres"
@@ -54,8 +55,8 @@ func TestInjectMizuHeaders(t *testing.T) {
 		dmarcResult,
 		arcResult,
 		false, // not junk
-		false, // don't disable mizu headers
-		nil,   // no spam headers
+		HeaderStampOptions{StripClientIdentity: true}, // submission defaults
+		nil, // no spam headers
 	)
 
 	// Verify the modified email contains expected headers
@@ -63,9 +64,7 @@ func TestInjectMizuHeaders(t *testing.T) {
 		name     string
 		contains string
 	}{
-		{"Received header exists", "Received: from"},
-		{"Received contains HELO hostname", heloHostname},
-		{"Received contains client IP", "1.2.3.4"},
+		{"Received header exists", "Received: by"},
 		{"Received contains server domain", domain},
 		{"Received contains protocol", "ESMTPS"},
 		{"Received contains trace ID", traceID},
@@ -85,6 +84,14 @@ func TestInjectMizuHeaders(t *testing.T) {
 				t.Errorf("Modified email does not contain expected string: %q\nEmail:\n%s", tt.contains, modifiedEmail)
 			}
 		})
+	}
+
+	// Submission servers must not disclose the submitting client: neither the
+	// HELO name nor the client IP may appear anywhere in the stamped headers.
+	for _, leaked := range []string{heloHostname, "1.2.3.4"} {
+		if strings.Contains(modifiedEmail, leaked) {
+			t.Errorf("Submission must not disclose client identity %q:\n%s", leaked, modifiedEmail)
+		}
 	}
 
 	// Verify headers come before original email
@@ -108,12 +115,12 @@ func TestInjectMizuHeaders_Junk(t *testing.T) {
 		"spammer.bad.com",
 		"trace123",
 		"TLS 1.2",
-		nil,   // no SPF
-		nil,   // no DMARC
-		nil,   // no ARC
-		true,  // IS JUNK
-		false, // don't disable mizu headers
-		nil,   // no spam headers
+		nil,  // no SPF
+		nil,  // no DMARC
+		nil,  // no ARC
+		true, // IS JUNK
+		HeaderStampOptions{StripClientIdentity: true}, // submission defaults
+		nil, // no spam headers
 	)
 
 	// Should mark as junk
@@ -127,6 +134,50 @@ func TestInjectMizuHeaders_Junk(t *testing.T) {
 	}
 	if !strings.Contains(modifiedEmail, "dmarc=none") {
 		t.Error("Expected dmarc=none when no DMARC result")
+	}
+}
+
+func TestInjectMizuHeaders_RelayStripsAnalysis(t *testing.T) {
+	originalEmail := "From: sender@example.com\r\nSubject: Test\r\n\r\nBody\r\n"
+
+	// Relay servers have no milter/rspamd. Even with a junk verdict and rspamd
+	// milter headers present, a relay must stamp only Received + X-Mizu-Trace-ID.
+	spamHeaders := map[string][]string{
+		"X-Spam":                 {"yes"},
+		"Authentication-Results": {"mx.example.com; spf=pass"},
+	}
+
+	modifiedEmail := InjectMizuHeaders(
+		originalEmail,
+		"mail.example.com",
+		"1.2.3.4:5678",
+		"client.example.com",
+		"trace-relay",
+		"TLS 1.3",
+		nil, nil, nil,
+		true, // IS JUNK
+		HeaderStampOptions{OmitAnalysisHeaders: true}, // relay defaults
+		spamHeaders,
+	)
+
+	// Kept on relay
+	if !strings.Contains(modifiedEmail, "X-Mizu-Trace-ID: trace-relay") {
+		t.Error("Expected X-Mizu-Trace-ID to be present on relay")
+	}
+	if !strings.Contains(modifiedEmail, "Received: from client.example.com (1.2.3.4)") {
+		t.Errorf("Expected relay Received header to keep the full client trace:\n%s", modifiedEmail)
+	}
+
+	// Stripped on relay
+	for _, forbidden := range []string{
+		"X-Mizu-Authentication-Results",
+		"X-Mizu-Junk",
+		"X-Spam",
+		"Authentication-Results:",
+	} {
+		if strings.Contains(modifiedEmail, forbidden) {
+			t.Errorf("Relay must omit %q, but it was present:\n%s", forbidden, modifiedEmail)
+		}
 	}
 }
 
@@ -144,8 +195,8 @@ func TestInjectMizuHeaders_NoTLS(t *testing.T) {
 		nil,
 		nil,
 		false,
-		false, // don't disable mizu headers
-		nil,   // no spam headers
+		HeaderStampOptions{StripClientIdentity: true}, // submission defaults
+		nil, // no spam headers
 	)
 
 	// Should use ESMTP (not ESMTPS) when no TLS
@@ -177,7 +228,9 @@ func TestInjectMizuHeaders_SpamHeaderSanitization(t *testing.T) {
 		"TLS 1.3",
 		nil, nil, nil,
 		false,
-		true, // disable mizu headers — focus the assertion on the spam path
+		// Disable X-Mizu-* to focus the assertion on the spam path; analysis
+		// headers stay on, so the spam headers are still appended.
+		HeaderStampOptions{DisableMizuHeaders: true, StripClientIdentity: true},
 		spamHeaders,
 	)
 
@@ -218,7 +271,8 @@ func TestInjectMizuHeaders_FoldedSpamHeaderPreserved(t *testing.T) {
 		"TLS 1.3",
 		nil, nil, nil,
 		false,
-		true, // disable mizu headers — focus on the spam path
+		// Disable X-Mizu-* to focus on the spam path; analysis headers stay on.
+		HeaderStampOptions{DisableMizuHeaders: true, StripClientIdentity: true},
 		spamHeaders,
 	)
 
@@ -262,6 +316,7 @@ func TestBuildReceivedHeader(t *testing.T) {
 		"sender.example.org",
 		"xyz789",
 		"TLS 1.3",
+		false, // keep the client trace
 	)
 
 	// Verify structure
@@ -287,6 +342,89 @@ func TestBuildReceivedHeader(t *testing.T) {
 	// Should end with CRLF
 	if !strings.HasSuffix(header, "\r\n") {
 		t.Error("Received header should end with CRLF")
+	}
+}
+
+// With strip_client_identity on - the default for submission servers - the
+// submitting user's machine name and network address must not reach recipients, so
+// the "from" clause is dropped entirely. Everything else about the hop - server
+// domain, protocol, trace ID, timestamp - is preserved.
+func TestBuildReceivedHeader_StripsClientIdentity(t *testing.T) {
+	header := buildReceivedHeader(
+		"smtp.example.com",
+		"192.0.2.1:54321",
+		"laptop.home.arpa",
+		"xyz789",
+		"TLS 1.3",
+		true, // strip the client identity
+	)
+
+	if !strings.HasPrefix(header, "Received: by smtp.example.com with ESMTPS id xyz789;") {
+		t.Errorf("Submission Received header should omit the from clause, got:\n%s", header)
+	}
+
+	for _, leaked := range []string{"laptop.home.arpa", "192.0.2.1", "from "} {
+		if strings.Contains(header, leaked) {
+			t.Errorf("Submission Received header must not contain %q, got:\n%s", leaked, header)
+		}
+	}
+
+	if !strings.HasSuffix(header, "\r\n") {
+		t.Error("Received header should end with CRLF")
+	}
+}
+
+// The whole point of strip_client_identity is that a server's config decides what
+// reaches the recipient, so cover the wiring from ServerConfig through to the
+// stamped bytes rather than just the flag in isolation.
+func TestHeaderStampOptions_FromServerConfig(t *testing.T) {
+	boolPtr := func(b bool) *bool { return &b }
+
+	tests := []struct {
+		name          string
+		cfg           config.ServerConfig
+		wantClientHop bool
+	}{
+		{name: "submission strips by default", cfg: config.ServerConfig{Type: "submission"}, wantClientHop: false},
+		{name: "relay keeps by default", cfg: config.ServerConfig{Type: "relay"}, wantClientHop: true},
+		{
+			name:          "submission can opt out",
+			cfg:           config.ServerConfig{Type: "submission", StripClientIdentity: boolPtr(false)},
+			wantClientHop: true,
+		},
+		{
+			name:          "relay can opt in",
+			cfg:           config.ServerConfig{Type: "relay", StripClientIdentity: boolPtr(true)},
+			wantClientHop: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := tt.cfg
+			out := InjectMizuHeaders(
+				"Subject: Test\r\n\r\nBody\r\n",
+				"mail.example.com",
+				"1.2.3.4:5678",
+				"client.example.com",
+				"trace-wiring",
+				"TLS 1.3",
+				nil, nil, nil,
+				false,
+				headerStampOptions(&cfg),
+				nil,
+			)
+
+			gotClientHop := strings.Contains(out, "client.example.com") || strings.Contains(out, "1.2.3.4")
+			if gotClientHop != tt.wantClientHop {
+				t.Errorf("client identity present = %v, want %v; headers:\n%s", gotClientHop, tt.wantClientHop, out)
+			}
+
+			// Either way the hop itself is stamped, with its trace ID intact.
+			if !strings.Contains(out, "by mail.example.com with ESMTPS id trace-wiring;") {
+				t.Errorf("Received hop missing or malformed:\n%s", out)
+			}
+		})
 	}
 }
 

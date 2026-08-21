@@ -136,6 +136,11 @@ Key packages:
    - Three actions: `"reject"` (submission default), `"fix"` (relay default), `"none"`
    - Automatic header generation: RFC-compliant Date timestamps and unique Message-IDs
    - Case-insensitive header detection
+   - **Header stamping is controlled by `HeaderStampOptions`**, derived from the server config by `headerStampOptions()` and passed to `InjectMizuHeaders`. Three independent settings:
+     - `OmitAnalysisHeaders` (set on **relay**, which has no milter/rspamd): drops `X-Mizu-Authentication-Results`, `X-Mizu-Junk`, and spam/milter headers, leaving only `Received` + `X-Mizu-Trace-ID`.
+     - `DisableMizuHeaders` (`disable_mizu_headers`): drops all `X-Mizu-*`. The `Received` header is always stamped - RFC 5321 §4.4 requires it.
+     - `StripClientIdentity` (`strip_client_identity`, see below): omits the `from <HELO> (<IP>)` clause from `Received`, yielding `Received: by <host> with ESMTPS id <trace>;`.
+   - **`strip_client_identity`** (per-server, `*bool`): defaults to **true on submission**, **false on relay**. On submission the HELO name and client IP identify the end user's machine and network, and stamping them publishes the user's home or mobile address to every recipient; the trace ID is retained so hops stay correlatable with our own logs. On relay the full trace is kept, since downstream receivers use it for SPF/DMARC forensics and loop detection. Set explicitly to override either default.
 
 ### Configuration System
 

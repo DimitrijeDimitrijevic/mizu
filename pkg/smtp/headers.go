@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"migadu/mizu/pkg/config"
 	"migadu/mizu/pkg/validation"
 )
 
@@ -21,26 +22,56 @@ func normalizeToCRLF(s string) string {
 	return strings.ReplaceAll(s, "\n", "\r\n")
 }
 
+// HeaderStampOptions controls which trace and analysis headers a server stamps.
+// The three settings are independent: DisableMizuHeaders and OmitAnalysisHeaders
+// govern the X-Mizu-* and milter headers, StripClientIdentity governs Received.
+type HeaderStampOptions struct {
+	// DisableMizuHeaders drops every X-Mizu-* header. The Received header is
+	// still stamped, since RFC 5321 section 4.4 requires it.
+	DisableMizuHeaders bool
+
+	// OmitAnalysisHeaders drops X-Mizu-Authentication-Results, X-Mizu-Junk and the
+	// milter/rspamd spam headers, leaving only Received and X-Mizu-Trace-ID. Set on
+	// relay servers, which have no milter/rspamd to produce those verdicts.
+	OmitAnalysisHeaders bool
+
+	// StripClientIdentity omits the "from <HELO> (<client IP>)" clause from the
+	// Received header, so the submitting client's machine and network are not
+	// disclosed to recipients. See buildReceivedHeader.
+	StripClientIdentity bool
+}
+
+// headerStampOptions derives the stamping policy from a server's configuration.
+func headerStampOptions(cfg *config.ServerConfig) HeaderStampOptions {
+	return HeaderStampOptions{
+		DisableMizuHeaders: cfg.DisableMizuHeaders,
+		// A relay has no milter/rspamd, so it has no analysis verdicts to stamp.
+		OmitAnalysisHeaders: cfg.IsRelay(),
+		StripClientIdentity: cfg.StripsClientIdentity(),
+	}
+}
+
 // InjectMizuHeaders adds Received and X-Mizu-* headers to the email
 // These headers provide email tracing, authentication results, and debugging information
-// If disableMizuHeaders is true, only the Received header is added (X-Mizu-* headers are skipped)
 // spamHeaders contains additional headers from spam checking (e.g., X-Junk: yes); a key
 // may map to multiple values, which become separate header lines (e.g. Authentication-Results).
-func InjectMizuHeaders(rawEmail, domain, remoteAddr, heloHostname, traceID string, tlsVersion string, spfResult *validation.SPFResult, dmarcResult *validation.DMARCResult, arcResult *validation.ARCResult, isJunk bool, disableMizuHeaders bool, spamHeaders map[string][]string) string {
+// opts selects which of those headers are stamped; see HeaderStampOptions.
+func InjectMizuHeaders(rawEmail, domain, remoteAddr, heloHostname, traceID string, tlsVersion string, spfResult *validation.SPFResult, dmarcResult *validation.DMARCResult, arcResult *validation.ARCResult, isJunk bool, opts HeaderStampOptions, spamHeaders map[string][]string) string {
 	// Build the Received header (always added)
-	receivedHeader := buildReceivedHeader(domain, remoteAddr, heloHostname, traceID, tlsVersion)
+	receivedHeader := buildReceivedHeader(domain, remoteAddr, heloHostname, traceID, tlsVersion, opts.StripClientIdentity)
 
 	// Build X-Mizu-* headers (only if not disabled)
 	var mizuHeaders string
-	if !disableMizuHeaders {
-		mizuHeaders = buildMizuHeaders(traceID, spfResult, dmarcResult, arcResult, isJunk)
+	if !opts.DisableMizuHeaders {
+		mizuHeaders = buildMizuHeaders(traceID, spfResult, dmarcResult, arcResult, isJunk, opts.OmitAnalysisHeaders)
 	}
 
 	// Build spam check headers (from rspamd or other spam checkers).
 	// Sanitize both name and value: although rspamd is internal, a stray CR/LF
 	// in either field would forge an arbitrary header or inject body content.
+	// Relay servers have no milter, so these are omitted entirely.
 	var spamHeaderStr string
-	if len(spamHeaders) > 0 {
+	if len(spamHeaders) > 0 && !opts.OmitAnalysisHeaders {
 		var sb strings.Builder
 		for name, values := range spamHeaders {
 			safeName := sanitizeHeaderValue(name)
@@ -65,16 +96,15 @@ func InjectMizuHeaders(rawEmail, domain, remoteAddr, heloHostname, traceID strin
 
 // buildReceivedHeader creates a standard Received header for email tracing
 // Format follows RFC 5321 section 4.4 (Trace Information)
-func buildReceivedHeader(domain, remoteAddr, heloHostname, traceID, tlsVersion string) string {
-	// Sanitize heloHostname: strip any control characters to prevent header injection
-	heloHostname = sanitizeHeaderValue(heloHostname)
-
-	// Extract IP and port from remoteAddr
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		host = remoteAddr // Fallback if parsing fails
-	}
-
+//
+// When stripClientIdentity is set - the default on submission servers, configurable
+// per server via strip_client_identity - the "from" clause is omitted entirely. The
+// HELO name and the client IP identify the submitting user's machine and network,
+// and stamping them here publishes the user's home or mobile address to every
+// recipient. The trace ID stays in the header, so the hop remains correlatable with
+// our own logs. Relay servers keep the full client trace by default: downstream
+// receivers rely on it for SPF/DMARC forensics and loop detection.
+func buildReceivedHeader(domain, remoteAddr, heloHostname, traceID, tlsVersion string, stripClientIdentity bool) string {
 	// Determine protocol (SMTP, ESMTP, ESMTPS, ESMTPSA)
 	protocol := "ESMTP"
 	if tlsVersion != "none" && tlsVersion != "" {
@@ -85,14 +115,24 @@ func buildReceivedHeader(domain, remoteAddr, heloHostname, traceID, tlsVersion s
 	timestamp := time.Now().Format(time.RFC1123Z)
 
 	// Build Received header
-	// Format: Received: from <client> by <server> with <protocol> id <id>; <timestamp>
+	// Format: Received: [from <client>] by <server> with <protocol> id <id>; <timestamp>
 	var sb strings.Builder
-	sb.WriteString("Received: from ")
-	sb.WriteString(heloHostname)
-	sb.WriteString(" (")
-	sb.WriteString(host)
-	sb.WriteString(")\r\n")
-	sb.WriteString("\tby ")
+	sb.WriteString("Received: ")
+	if !stripClientIdentity {
+		// Extract IP and port from remoteAddr
+		host, _, err := net.SplitHostPort(remoteAddr)
+		if err != nil {
+			host = remoteAddr // Fallback if parsing fails
+		}
+
+		sb.WriteString("from ")
+		// Sanitize heloHostname: strip any control characters to prevent header injection
+		sb.WriteString(sanitizeHeaderValue(heloHostname))
+		sb.WriteString(" (")
+		sb.WriteString(host)
+		sb.WriteString(")\r\n\t")
+	}
+	sb.WriteString("by ")
 	sb.WriteString(domain)
 	sb.WriteString(" with ")
 	sb.WriteString(protocol)
@@ -149,8 +189,10 @@ func sanitizeFoldedHeaderValue(s string) string {
 	return sb.String()
 }
 
-// buildMizuHeaders creates custom X-Mizu-* headers for debugging and analysis
-func buildMizuHeaders(traceID string, spfResult *validation.SPFResult, dmarcResult *validation.DMARCResult, arcResult *validation.ARCResult, isJunk bool) string {
+// buildMizuHeaders creates custom X-Mizu-* headers for debugging and analysis.
+// X-Mizu-Trace-ID is always added. When omitAnalysisHeaders is true (relay servers),
+// the X-Mizu-Authentication-Results and X-Mizu-Junk lines are skipped.
+func buildMizuHeaders(traceID string, spfResult *validation.SPFResult, dmarcResult *validation.DMARCResult, arcResult *validation.ARCResult, isJunk bool, omitAnalysisHeaders bool) string {
 	var sb strings.Builder
 
 	// X-Mizu-Trace-ID: Unique identifier for this email transaction
@@ -158,16 +200,18 @@ func buildMizuHeaders(traceID string, spfResult *validation.SPFResult, dmarcResu
 	sb.WriteString(traceID)
 	sb.WriteString("\r\n")
 
-	// X-Mizu-Authentication-Results: Summary of authentication results
-	sb.WriteString("X-Mizu-Authentication-Results: ")
-	sb.WriteString(buildAuthenticationSummary(spfResult, dmarcResult, arcResult))
-	sb.WriteString("\r\n")
+	if !omitAnalysisHeaders {
+		// X-Mizu-Authentication-Results: Summary of authentication results
+		sb.WriteString("X-Mizu-Authentication-Results: ")
+		sb.WriteString(buildAuthenticationSummary(spfResult, dmarcResult, arcResult))
+		sb.WriteString("\r\n")
 
-	// X-Mizu-Junk: Spam classification
-	if isJunk {
-		sb.WriteString("X-Mizu-Junk: YES\r\n")
-	} else {
-		sb.WriteString("X-Mizu-Junk: NO\r\n")
+		// X-Mizu-Junk: Spam classification
+		if isJunk {
+			sb.WriteString("X-Mizu-Junk: YES\r\n")
+		} else {
+			sb.WriteString("X-Mizu-Junk: NO\r\n")
+		}
 	}
 
 	return sb.String()

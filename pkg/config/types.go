@@ -33,7 +33,7 @@ type DefaultsConfig struct {
 type ServerConfig struct {
 	// === Identity ===
 	Name string `toml:"name"` // Human-readable name (e.g., "mx-primary", "submission-tls")
-	Type string `toml:"type"` // "relay" (MX server) or "submission" (MSA server)
+	Type string `toml:"type"` // "relay" (MX server) or "submission" (MSA server). Relay servers have no milter/rspamd and stamp only Received + X-Mizu-Trace-ID (X-Mizu-Authentication-Results, X-Mizu-Junk, and spam/milter headers are omitted). The type also sets the default for strip_client_identity.
 
 	// === Network ===
 	ListenAddr           string   `toml:"listen_addr"`            // Address to bind (e.g., ":25", ":465", ":587", "127.0.0.1:2525")
@@ -57,7 +57,17 @@ type ServerConfig struct {
 
 	// === Debugging ===
 	Debug              bool `toml:"debug"`                // Enable SMTP protocol debug logging (shows all SMTP commands and responses)
-	DisableMizuHeaders bool `toml:"disable_mizu_headers"` // Disable X-Mizu-* headers (keeps Received header, removes X-Mizu-Trace-ID, X-Mizu-Authentication-Results, X-Mizu-Junk)
+	DisableMizuHeaders bool `toml:"disable_mizu_headers"` // Disable X-Mizu-* headers (keeps Received header, removes X-Mizu-Trace-ID, X-Mizu-Authentication-Results, X-Mizu-Junk). Note: relay servers already omit X-Mizu-Authentication-Results, X-Mizu-Junk, and spam/milter headers regardless of this flag.
+
+	// === Privacy ===
+	// StripClientIdentity omits the "from <HELO> (<client IP>)" clause from the
+	// Received header this server stamps, so the submitting user's machine name and
+	// network are not published to recipients. The rest of the hop (server hostname,
+	// protocol, trace ID, timestamp) is preserved.
+	// Defaults to true on submission servers and false on relay servers, where
+	// downstream receivers rely on the full trace for SPF/DMARC forensics and loop
+	// detection. Set explicitly to override either default.
+	StripClientIdentity *bool `toml:"strip_client_identity"`
 
 	// === Email Validation ===
 	HELOValidation        *bool  `toml:"helo_validation"`         // Validate HELO/EHLO hostname for security (default: true, set to false to disable)
@@ -251,6 +261,16 @@ func (s *ServerConfig) IsSubmission() bool {
 	return s.Type == "submission"
 }
 
+// StripsClientIdentity reports whether the Received header stamped by this server
+// should omit the client's HELO name and IP. Unset means the per-type default:
+// stripped on submission, kept on relay.
+func (s *ServerConfig) StripsClientIdentity() bool {
+	if s.StripClientIdentity == nil {
+		return s.IsSubmission()
+	}
+	return *s.StripClientIdentity
+}
+
 // IsTLSEnabled returns true if TLS is explicitly enabled
 func (s *ServerConfig) IsTLSEnabled() bool {
 	return s.TLS.Enabled
@@ -298,6 +318,14 @@ func (s *ServerConfig) ApplyDefaults(defaults DefaultsConfig) {
 	if s.HELOValidation == nil {
 		trueVal := true
 		s.HELOValidation = &trueVal
+	}
+
+	// StripClientIdentity defaults to true on submission servers, where the client
+	// is an end user whose network should not be disclosed to recipients, and false
+	// on relay servers, where the full trace is operationally useful downstream.
+	if s.StripClientIdentity == nil {
+		defaultVal := s.IsSubmission()
+		s.StripClientIdentity = &defaultVal
 	}
 }
 

@@ -1728,7 +1728,7 @@ func (s *Session) deliverMessage(rawEmail string) error {
 		s.dmarcResult,
 		s.arcResult,
 		s.isJunk,
-		s.serverConfig.DisableMizuHeaders,
+		headerStampOptions(s.serverConfig),
 		spamHeaders,
 	)
 
