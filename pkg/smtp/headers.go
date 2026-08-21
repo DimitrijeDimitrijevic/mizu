@@ -28,9 +28,10 @@ func normalizeToCRLF(s string) string {
 // spamHeaders contains additional headers from spam checking (e.g., X-Junk: yes); a key
 // may map to multiple values, which become separate header lines (e.g. Authentication-Results).
 // spamHeaders are NOT subject to toggles — rspamd's add_headers are injected verbatim.
-func InjectMizuHeaders(rawEmail, domain, remoteAddr, heloHostname, traceID string, tlsVersion string, spfResult *validation.SPFResult, dmarcResult *validation.DMARCResult, arcResult *validation.ARCResult, isJunk bool, toggles config.HeaderToggles, spamHeaders map[string][]string) string {
+// stripClientIdentity omits the "from <HELO> (<client IP>)" clause from Received; see buildReceivedHeader.
+func InjectMizuHeaders(rawEmail, domain, remoteAddr, heloHostname, traceID string, tlsVersion string, spfResult *validation.SPFResult, dmarcResult *validation.DMARCResult, arcResult *validation.ARCResult, isJunk bool, toggles config.HeaderToggles, stripClientIdentity bool, spamHeaders map[string][]string) string {
 	// Build the Received header (always added)
-	receivedHeader := buildReceivedHeader(domain, remoteAddr, heloHostname, traceID, tlsVersion)
+	receivedHeader := buildReceivedHeader(domain, remoteAddr, heloHostname, traceID, tlsVersion, stripClientIdentity)
 
 	// Build X-Mizu-* headers (per-header toggles)
 	mizuHeaders := buildMizuHeaders(traceID, spfResult, dmarcResult, arcResult, isJunk, toggles)
@@ -64,16 +65,15 @@ func InjectMizuHeaders(rawEmail, domain, remoteAddr, heloHostname, traceID strin
 
 // buildReceivedHeader creates a standard Received header for email tracing
 // Format follows RFC 5321 section 4.4 (Trace Information)
-func buildReceivedHeader(domain, remoteAddr, heloHostname, traceID, tlsVersion string) string {
-	// Sanitize heloHostname: strip any control characters to prevent header injection
-	heloHostname = sanitizeHeaderValue(heloHostname)
-
-	// Extract IP and port from remoteAddr
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		host = remoteAddr // Fallback if parsing fails
-	}
-
+//
+// When stripClientIdentity is set — the default on submission servers, configurable
+// per server via strip_client_identity — the "from" clause is omitted entirely. The
+// HELO name and the client IP identify the submitting user's machine and network,
+// and stamping them here publishes the user's home or mobile address to every
+// recipient. The trace ID stays in the header, so the hop remains correlatable with
+// our own logs. Relay servers keep the full client trace by default: downstream
+// receivers rely on it for SPF/DMARC forensics and loop detection.
+func buildReceivedHeader(domain, remoteAddr, heloHostname, traceID, tlsVersion string, stripClientIdentity bool) string {
 	// Determine protocol (SMTP, ESMTP, ESMTPS, ESMTPSA)
 	protocol := "ESMTP"
 	if tlsVersion != "none" && tlsVersion != "" {
@@ -84,14 +84,24 @@ func buildReceivedHeader(domain, remoteAddr, heloHostname, traceID, tlsVersion s
 	timestamp := time.Now().Format(time.RFC1123Z)
 
 	// Build Received header
-	// Format: Received: from <client> by <server> with <protocol> id <id>; <timestamp>
+	// Format: Received: [from <client>] by <server> with <protocol> id <id>; <timestamp>
 	var sb strings.Builder
-	sb.WriteString("Received: from ")
-	sb.WriteString(heloHostname)
-	sb.WriteString(" (")
-	sb.WriteString(host)
-	sb.WriteString(")\r\n")
-	sb.WriteString("\tby ")
+	sb.WriteString("Received: ")
+	if !stripClientIdentity {
+		// Extract IP and port from remoteAddr
+		host, _, err := net.SplitHostPort(remoteAddr)
+		if err != nil {
+			host = remoteAddr // Fallback if parsing fails
+		}
+
+		sb.WriteString("from ")
+		// Sanitize heloHostname: strip any control characters to prevent header injection
+		sb.WriteString(sanitizeHeaderValue(heloHostname))
+		sb.WriteString(" (")
+		sb.WriteString(host)
+		sb.WriteString(")\r\n\t")
+	}
+	sb.WriteString("by ")
 	sb.WriteString(domain)
 	sb.WriteString(" with ")
 	sb.WriteString(protocol)

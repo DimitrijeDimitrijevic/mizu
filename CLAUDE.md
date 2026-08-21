@@ -173,6 +173,22 @@ Key packages:
   fallback). Unknown/stale config keys produce a startup stderr warning
   (`warnUndecodedKeys` in [pkg/config/loader.go](pkg/config/loader.go))
 
+**Received header privacy (`strip_client_identity`):**
+- Per-server `[[server]]` `*bool` that omits the `from <HELO> (<client IP>)`
+  clause from the `Received` header this server stamps, yielding
+  `Received: by <host> with ESMTPS id <trace>;`. The trace ID is retained so
+  hops stay correlatable with our own logs; a deliberate deviation from
+  RFC 5321 §4.4, which recommends recording the source.
+- Defaults to **true on submission**, **false on relay**: on submission the HELO
+  name and client IP identify the end user's machine and home/mobile network,
+  and stamping them publishes that to every recipient; on relay the full trace
+  is kept because downstream receivers use it for SPF/DMARC forensics and loop
+  detection. Set explicitly to override either default.
+- Resolved by `ServerConfig.StripsClientIdentity()` and materialized in
+  `ApplyDefaults`; threaded into `buildReceivedHeader` via `InjectMizuHeaders`
+  ([pkg/smtp/headers.go](pkg/smtp/headers.go)). Independent of the X-Mizu-*
+  toggles above — it governs only the `Received` `from` clause.
+
 **Authentication Configuration (for submission servers):**
 - `[server.auth]` section configures SMTP AUTH for ports 587/465
 - `enabled`: Enable SMTP AUTH (advertise AUTH in EHLO response)

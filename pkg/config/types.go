@@ -40,7 +40,7 @@ const MaxMessageSizeLimit = 100 * 1024 * 1024 // 100 MiB
 type ServerConfig struct {
 	// === Identity ===
 	Name string `toml:"name"` // Human-readable name (e.g., "mx-primary", "submission-tls")
-	Type string `toml:"type"` // "relay" (MX server) or "submission" (MSA server)
+	Type string `toml:"type"` // "relay" (MX server) or "submission" (MSA server). Also sets the default for strip_client_identity (stripped on submission, kept on relay).
 
 	// === Network ===
 	ListenAddr           string       `toml:"listen_addr"`            // Address to bind (e.g., ":25", ":465", ":587", "127.0.0.1:2525")
@@ -101,6 +101,19 @@ type ServerConfig struct {
 	EnableTraceIDHeader     *bool `toml:"enable_trace_id_header"`     // X-Mizu-Trace-ID (default: true)
 	EnableAuthResultsHeader *bool `toml:"enable_auth_results_header"` // X-Mizu-Authentication-Results (default: true)
 	EnableJunkHeader        *bool `toml:"enable_junk_header"`         // X-Mizu-Junk (default: true). Governs only this header: junk.apply_action adds its own junk marker (e.g. X-Spam) independently
+
+	// === Privacy ===
+	// StripClientIdentity omits the "from <HELO> (<client IP>)" clause from the
+	// Received header this server stamps, so the submitting client's machine name
+	// and network are not published to recipients. The rest of the hop (server
+	// hostname, protocol, trace ID, timestamp) is preserved, so the message stays
+	// correlatable with our own logs. This deliberately deviates from RFC 5321 §4.4,
+	// which recommends recording the source in the Received line.
+	// Defaults to true on submission servers (the client is an end user whose home
+	// or mobile address should not reach recipients) and false on relay servers,
+	// where downstream receivers rely on the full trace for SPF/DMARC forensics and
+	// loop detection. Set explicitly to override either default.
+	StripClientIdentity *bool `toml:"strip_client_identity"`
 
 	// === Email Validation ===
 	HELOValidation        *bool  `toml:"helo_validation"`         // Validate HELO/EHLO hostname (default: true on relay, false on submission — Windows MUAs send bare machine names; explicit setting wins)
@@ -354,6 +367,16 @@ func (s *ServerConfig) IsSubmission() bool {
 	return s.Type == "submission"
 }
 
+// StripsClientIdentity reports whether the Received header stamped by this server
+// should omit the client's HELO name and IP. Unset means the per-type default:
+// stripped on submission, kept on relay.
+func (s *ServerConfig) StripsClientIdentity() bool {
+	if s.StripClientIdentity == nil {
+		return s.IsSubmission()
+	}
+	return *s.StripClientIdentity
+}
+
 // LegacyAuthCapEnabled reports whether the obsolete "AUTH=" EHLO line should
 // be advertised alongside the standard AUTH capability (default: true; see
 // the LegacyAuthCap field comment for the Outlook background).
@@ -456,6 +479,14 @@ func (s *ServerConfig) ApplyDefaults(defaults DefaultsConfig) {
 	if s.HELOValidation == nil {
 		v := !s.IsSubmission()
 		s.HELOValidation = &v
+	}
+
+	// StripClientIdentity defaults to true on submission servers, where the client
+	// is an end user whose network should not be disclosed to recipients, and false
+	// on relay servers, where the full trace is operationally useful downstream.
+	if s.StripClientIdentity == nil {
+		v := s.IsSubmission()
+		s.StripClientIdentity = &v
 	}
 }
 

@@ -1873,6 +1873,7 @@ func (s *Session) deliverMessage(ctx context.Context, rawEmail string) error {
 	}
 
 	mizuHeaderToggles := s.serverConfig.HeaderToggles()
+	stripClientIdentity := s.serverConfig.StripsClientIdentity()
 
 	emailWithHeaders := InjectMizuHeaders(
 		rawEmail,
@@ -1886,13 +1887,15 @@ func (s *Session) deliverMessage(ctx context.Context, rawEmail string) error {
 		s.arcResult,
 		s.isJunk,
 		mizuHeaderToggles,
+		stripClientIdentity,
 		spamHeaders,
 	)
 
 	s.Logger.Info("Injected Received and X-Mizu-* headers",
 		"trace_id_header", mizuHeaderToggles.TraceID,
 		"auth_results_header", mizuHeaderToggles.AuthResults,
-		"junk_header", mizuHeaderToggles.Junk)
+		"junk_header", mizuHeaderToggles.Junk,
+		"strip_client_identity", stripClientIdentity)
 
 	// Apply junk modifications if message is marked as junk
 	if s.isJunk {

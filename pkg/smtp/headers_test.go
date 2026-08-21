@@ -56,7 +56,8 @@ func TestInjectMizuHeaders(t *testing.T) {
 		arcResult,
 		false, // not junk
 		config.HeaderToggles{TraceID: true, AuthResults: true, Junk: true},
-		nil, // no spam headers
+		false, // keep client identity (relay behavior)
+		nil,   // no spam headers
 	)
 
 	// Verify the modified email contains expected headers
@@ -114,7 +115,8 @@ func TestInjectMizuHeaders_Junk(t *testing.T) {
 		nil,  // no ARC
 		true, // IS JUNK
 		config.HeaderToggles{TraceID: true, AuthResults: true, Junk: true},
-		nil, // no spam headers
+		false, // keep client identity
+		nil,   // no spam headers
 	)
 
 	// Should mark as junk
@@ -146,7 +148,8 @@ func TestInjectMizuHeaders_NoTLS(t *testing.T) {
 		nil,
 		false,
 		config.HeaderToggles{TraceID: true, AuthResults: true, Junk: true},
-		nil, // no spam headers
+		false, // keep client identity
+		nil,   // no spam headers
 	)
 
 	// Should use ESMTP (not ESMTPS) when no TLS
@@ -202,6 +205,7 @@ func TestInjectMizuHeaders_ToggleSuppression(t *testing.T) {
 				nil, nil, nil,
 				false,
 				tc.toggles,
+				false, // keep client identity
 				nil,
 			)
 
@@ -243,6 +247,7 @@ func TestInjectMizuHeaders_SpamHeaderSanitization(t *testing.T) {
 		nil, nil, nil,
 		false,
 		config.HeaderToggles{}, // no X-Mizu-* headers — focus the assertion on the spam path
+		false,                  // keep client identity
 		spamHeaders,
 	)
 
@@ -284,6 +289,7 @@ func TestInjectMizuHeaders_FoldedSpamHeaderPreserved(t *testing.T) {
 		nil, nil, nil,
 		false,
 		config.HeaderToggles{}, // no X-Mizu-* headers — focus on the spam path
+		false,                  // keep client identity
 		spamHeaders,
 	)
 
@@ -327,6 +333,7 @@ func TestBuildReceivedHeader(t *testing.T) {
 		"sender.example.org",
 		"xyz789",
 		"TLS 1.3",
+		false, // keep the client trace
 	)
 
 	// Verify structure
@@ -352,6 +359,90 @@ func TestBuildReceivedHeader(t *testing.T) {
 	// Should end with CRLF
 	if !strings.HasSuffix(header, "\r\n") {
 		t.Error("Received header should end with CRLF")
+	}
+}
+
+// With strip_client_identity on — the default for submission servers — the
+// submitting user's machine name and network address must not reach recipients, so
+// the "from" clause is dropped entirely. Everything else about the hop — server
+// domain, protocol, trace ID, timestamp — is preserved.
+func TestBuildReceivedHeader_StripsClientIdentity(t *testing.T) {
+	header := buildReceivedHeader(
+		"smtp.example.com",
+		"192.0.2.1:54321",
+		"laptop.home.arpa",
+		"xyz789",
+		"TLS 1.3",
+		true, // strip the client identity
+	)
+
+	if !strings.HasPrefix(header, "Received: by smtp.example.com with ESMTPS id xyz789;") {
+		t.Errorf("Submission Received header should omit the from clause, got:\n%s", header)
+	}
+
+	for _, leaked := range []string{"laptop.home.arpa", "192.0.2.1", "from "} {
+		if strings.Contains(header, leaked) {
+			t.Errorf("Submission Received header must not contain %q, got:\n%s", leaked, header)
+		}
+	}
+
+	if !strings.HasSuffix(header, "\r\n") {
+		t.Error("Received header should end with CRLF")
+	}
+}
+
+// The point of strip_client_identity is that a server's config decides what reaches
+// the recipient, so cover the wiring from ServerConfig.StripsClientIdentity() through
+// InjectMizuHeaders to the stamped bytes, not just the flag in isolation.
+func TestInjectMizuHeaders_StripsClientIdentity(t *testing.T) {
+	boolPtr := func(b bool) *bool { return &b }
+
+	tests := []struct {
+		name          string
+		cfg           config.ServerConfig
+		wantClientHop bool
+	}{
+		{name: "submission strips by default", cfg: config.ServerConfig{Type: "submission"}, wantClientHop: false},
+		{name: "relay keeps by default", cfg: config.ServerConfig{Type: "relay"}, wantClientHop: true},
+		{
+			name:          "submission can opt out",
+			cfg:           config.ServerConfig{Type: "submission", StripClientIdentity: boolPtr(false)},
+			wantClientHop: true,
+		},
+		{
+			name:          "relay can opt in",
+			cfg:           config.ServerConfig{Type: "relay", StripClientIdentity: boolPtr(true)},
+			wantClientHop: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := tt.cfg
+			out := InjectMizuHeaders(
+				"Subject: Test\r\n\r\nBody\r\n",
+				"mail.example.com",
+				"1.2.3.4:5678",
+				"client.example.com",
+				"trace-wiring",
+				"TLS 1.3",
+				nil, nil, nil,
+				false,
+				cfg.HeaderToggles(),
+				cfg.StripsClientIdentity(),
+				nil,
+			)
+
+			gotClientHop := strings.Contains(out, "client.example.com") || strings.Contains(out, "1.2.3.4")
+			if gotClientHop != tt.wantClientHop {
+				t.Errorf("client identity present = %v, want %v; headers:\n%s", gotClientHop, tt.wantClientHop, out)
+			}
+
+			// Either way the hop itself is stamped, with its trace ID intact.
+			if !strings.Contains(out, "by mail.example.com with ESMTPS id trace-wiring;") {
+				t.Errorf("Received hop missing or malformed:\n%s", out)
+			}
+		})
 	}
 }
 
