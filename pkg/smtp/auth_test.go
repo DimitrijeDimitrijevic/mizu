@@ -2,6 +2,7 @@ package smtp
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -98,14 +99,18 @@ func TestHTTPAuthenticator_Authenticate(t *testing.T) {
 		if authenticated {
 			t.Error("expected authentication to fail for non-existent user")
 		}
-		if err == nil {
-			t.Error("expected error describing failure reason")
+		// (false, nil) is the definitive "no such account" verdict the session
+		// layer turns into a permanent 535. An error here would instead produce
+		// a 454 telling the client to retry an address that cannot ever work.
+		if err != nil {
+			t.Errorf("unknown user must be a definitive (false, nil) verdict, got err: %v", err)
 		}
 	})
 
-	// Test user denied submission (403 from deny_smtp). This must be a clean,
-	// definitive auth failure — like 404, not like a 5xx service error — so the
-	// backend "denied" state doesn't surface as a transient error.
+	// Test user denied submission (403 from deny_smtp). The account EXISTS, so
+	// this is NOT the 404 "no such account" case: a deny can be lifted, and a
+	// permanent reply would have clients throw away a password that works again
+	// as soon as it is. It must carry an error, yielding a temporary 454.
 	t.Run("user denied", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusForbidden)
@@ -118,13 +123,13 @@ func TestHTTPAuthenticator_Authenticate(t *testing.T) {
 		if authenticated {
 			t.Error("expected authentication to fail for denied user")
 		}
+		// The account exists and the deny can be lifted, so this must carry an
+		// error (=> temporary 454), NOT the (false, nil) reserved for a 404.
 		if err == nil {
-			t.Fatal("expected error describing failure reason")
+			t.Error("denied user must return an error so the reply stays temporary")
 		}
-		// A definitive deny reads as "no such user", not a service-unavailable
-		// (transient) error, so the client is rejected rather than told to retry.
-		if strings.Contains(err.Error(), "unavailable") {
-			t.Errorf("403 should be a definitive deny, got service error: %v", err)
+		if errors.Is(err, errUserUnknown) {
+			t.Error("a deny must not be reported as an unknown user")
 		}
 	})
 

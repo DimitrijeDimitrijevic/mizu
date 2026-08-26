@@ -213,10 +213,34 @@ Key packages:
   403 Forbidden
   ```
 - Auth-backend status semantics: **200** = verify the returned hashes locally;
-  **404** = user unknown (AUTH rejected); **403** = user denied submission,
-  treated as a definitive AUTH failure exactly like 404 (not a transient/backend
-  error, so the client is rejected rather than told to retry); any other status =
-  backend error
+  **404** = user unknown (AUTH rejected, the only permanent failure);
+  **403** = user denied submission (AUTH rejected, but temporary — the account
+  exists and the deny can be lifted); any other status = backend error
+- AUTH failures map to two SMTP replies. The dividing line is whether the
+  **account exists**, not whether the credential was correct:
+  - **535 5.7.8 (permanent)** — backend 404 only. The address is not in the
+    table, so no retry can ever make it work and the client should say so.
+  - **454 4.7.0 (temporary)** — *everything else that fails*: wrong password,
+    an unusable/corrupt stored hash, a 200 carrying no hashes, a 403 denied
+    account, and any backend 5xx/timeout. Each of these can start working with
+    no change by the client, so a permanent reply would make clients discard a
+    password that is about to be valid again.
+  - The mechanism is `Authenticator.Authenticate`'s return pair
+    ([pkg/smtp/server.go](pkg/smtp/server.go)): `(false, nil)` is the *only*
+    permanent verdict. `fetchCredentials` returns the `errUserUnknown` sentinel
+    for a 404 and an ordinary error for everything else; the two call sites in
+    `AuthenticateWithIP` translate that sentinel into `(false, nil)` —
+    **change one and you must change the other** (the second is the
+    credentials-cache refetch branch, live only when `auth.cache.enabled=false`).
+  - **Never key this decision off `len(PasswordHashes) == 0`.** An empty hash
+    list arrives for a 404, a 403, *and* a 200 for an account with no credential
+    set — three cases with two different verdicts. Use the HTTP status.
+  - `auth_session.go` checks the error **first**, so an implementation that
+    signals a rejection with an error can only ever be too lenient, never too
+    harsh.
+  - Known trade-off: 535 vs 454 is a mailbox-enumeration oracle on the
+    submission port, accepted so clients can distinguish "no such address" from
+    "server down". The `AuthRateLimiter` tiers bound the probing.
 - `allowed_from` entries may be exact addresses, `*@domain` wildcards, or
   `/regex/` patterns (rcptd's regex_sender_login pass-through, matched
   case-insensitively against MAIL FROM with substring semantics like Postfix pcre)
