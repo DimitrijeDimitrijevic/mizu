@@ -3,6 +3,7 @@ package smtp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -117,13 +118,20 @@ func (a *HTTPAuthenticator) AuthenticateWithIP(username, password, remoteIP stri
 			// Fetch fresh credentials from backend
 			creds, err := a.fetchCredentials(username, remoteIP)
 			if err != nil {
+				// The account is gone from the backend: definitive, so (false,
+				// nil) for a permanent 535. See the contract on Authenticator in
+				// server.go.
+				if errors.Is(err, errUserUnknown) {
+					return false, nil
+				}
 				// Backend error - return error without caching
 				return false, err
 			}
 
-			// No password hashes means user not found
+			// Account exists but serves no usable hash. Nothing to verify
+			// against, yet the account is real, so this stays temporary.
 			if len(creds.PasswordHashes) == 0 {
-				return false, fmt.Errorf("no such user")
+				return false, fmt.Errorf("no password hashes for user")
 			}
 
 			// Verify password against fresh credentials
@@ -143,19 +151,32 @@ func (a *HTTPAuthenticator) AuthenticateWithIP(username, password, remoteIP stri
 	// Fetch credentials from backend (cache miss)
 	creds, err := a.fetchCredentials(username, remoteIP)
 	if err != nil {
-		// Cache negative result if auth cache enabled
+		// The backend has no row for this address. That is the ONE definitive
+		// rejection: no retry can conjure the account into existence, so it is
+		// the only thing that returns (false, nil) and becomes a permanent 535.
+		// See the contract on Authenticator in server.go.
+		if errors.Is(err, errUserUnknown) {
+			if a.authCache != nil {
+				a.authCache.SetFailure(username, password, AuthUserNotFound)
+			}
+			return false, nil
+		}
+		// Everything else - a denied account, a backend 5xx, a timeout - leaves
+		// the credential unjudged. Cache negative result if auth cache enabled.
 		if a.authCache != nil {
 			a.authCache.SetFailure(username, password, AuthFailed)
 		}
 		return false, err
 	}
 
-	// No password hashes means user not found
+	// The account exists but serves no usable hash (200 with an empty list).
+	// There is nothing to verify against, but the account is real and an
+	// operator can fix its credential, so this stays temporary.
 	if len(creds.PasswordHashes) == 0 {
 		if a.authCache != nil {
-			a.authCache.SetFailure(username, password, AuthUserNotFound)
+			a.authCache.SetFailure(username, password, AuthInvalidPassword)
 		}
-		return false, fmt.Errorf("no such user")
+		return false, fmt.Errorf("no password hashes for user")
 	}
 
 	// Verify password against fetched hashes (try all until one matches)
@@ -184,7 +205,17 @@ func (a *HTTPAuthenticator) verifyAgainstHashes(hashes []string, password string
 	return passwd.VerifyAny(hashes, password).Matched
 }
 
-// fetchCredentials fetches user credentials from the backend via GET request
+// errUserUnknown reports that the auth backend has no row for this address
+// (HTTP 404) - the account does not exist, as opposed to existing but failing
+// to authenticate. It is the ONLY condition that earns a permanent 535; every
+// other failure, including a denied account or one with no usable hash, is
+// temporary. Callers must test it with errors.Is before any generic error
+// handling, since it travels in the error return.
+var errUserUnknown = errors.New("user not found in auth backend")
+
+// fetchCredentials fetches user credentials from the backend via GET request.
+// Returns errUserUnknown when the backend has no such account (404); any other
+// non-nil error means the lookup itself did not produce a usable answer.
 func (a *HTTPAuthenticator) fetchCredentials(username, remoteIP string) (*AuthResponse, error) {
 	requestURL := BuildAuthURL(a.urlTemplate, username, remoteIP)
 
@@ -205,23 +236,27 @@ func (a *HTTPAuthenticator) fetchCredentials(username, remoteIP string) (*AuthRe
 	case http.StatusOK:
 		return authResp, nil
 	case http.StatusNotFound:
-		// 404 means user not found - this is not an error, just auth failure
+		// 404 is the one definitive "no such account" answer, and the only path
+		// to a permanent 535. Everything else that fails stays temporary.
 		a.logger.Debug("auth request: user not found",
 			"username", username,
 			"url", requestURL,
 			"status", status,
 			"response", string(body))
-		return authResp, nil
+		return nil, errUserUnknown
 	case http.StatusForbidden:
-		// 403 means the user is denied submission (deny_smtp). Like 404 this is a
-		// definitive auth failure rather than a backend error; authResp carries no
-		// hashes, so the caller rejects the AUTH. Logged distinctly so operators
-		// can tell a deny apart from an unknown user.
+		// 403 means the user is denied submission (deny_smtp). The account EXISTS
+		// - it is just not permitted to submit right now, and a deny can be
+		// lifted - so this must not read as "your credentials are permanently
+		// invalid". A permanent reply would have clients discard a stored
+		// password that starts working again the moment the deny is removed, so
+		// a deny is temporary. Logged distinctly so operators can tell a deny
+		// apart from an unknown user.
 		a.logger.Info("auth request: user denied submission",
 			"username", username,
 			"url", requestURL,
 			"status", status)
-		return authResp, nil
+		return nil, fmt.Errorf("user denied submission")
 	default:
 		a.logger.Warn("auth request failed",
 			"username", username,
@@ -235,9 +270,16 @@ func (a *HTTPAuthenticator) fetchCredentials(username, remoteIP string) (*AuthRe
 // FetchAuthCredentials performs the GET request Mizu sends to the auth backend:
 // bearer-token authorization, 404 treated as "user unknown" (empty response, no
 // error), JSON decode on 200. It returns the HTTP status code, the decoded
-// response (non-nil only on 200/404), and the raw body for diagnostics; err is
-// set only for transport, read, or decode failures. Shared with mizu-admin so
-// the CLI queries the backend exactly as the server does.
+// response, and the raw body for diagnostics; err is set only for transport,
+// read, or decode failures. Shared with mizu-admin so the CLI queries the
+// backend exactly as the server does.
+//
+// The response is non-nil on 200, 404, and 403 (empty for the latter two).
+// Note this is the raw transport helper: it reports the status and lets the
+// caller decide. The server's own policy lives in fetchCredentials, which keys
+// the permanent-vs-temporary verdict off the STATUS - only a 404 is permanent -
+// and never off len(PasswordHashes), since an empty hash list also arrives with
+// a 403 and with a 200 for an account that simply has no credential set.
 func FetchAuthCredentials(ctx context.Context, client *http.Client, requestURL, token string) (int, *AuthResponse, []byte, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", requestURL, nil)
 	if err != nil {
@@ -316,12 +358,17 @@ func (a *HTTPAuthenticator) CanSendAs(authenticatedUser, fromAddress string) boo
 	a.clearCredCacheEntry(authenticatedUser)
 	creds, err := a.fetchCredentials(authenticatedUser, "")
 	if err != nil {
-		a.logger.Error("failed to refetch credentials for CanSendAs check", "user", authenticatedUser, "error", err)
+		if errors.Is(err, errUserUnknown) {
+			// The account was removed mid-session; not a backend failure.
+			a.logger.Warn("user no longer exists during CanSendAs refetch", "user", authenticatedUser)
+		} else {
+			a.logger.Error("failed to refetch credentials for CanSendAs check", "user", authenticatedUser, "error", err)
+		}
 		return false
 	}
 
 	if len(creds.PasswordHashes) == 0 {
-		a.logger.Warn("user not found during CanSendAs refetch", "user", authenticatedUser)
+		a.logger.Warn("user serves no password hashes during CanSendAs refetch", "user", authenticatedUser)
 		return false
 	}
 

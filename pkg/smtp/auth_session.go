@@ -132,22 +132,26 @@ func (s *Session) Auth(mech string) (sasl.Server, error) {
 			s.authRateLimiter.RecordAuthAttempt(authCtx, remoteIP, user, authenticated)
 		}
 
-		// ERROR IS CHECKED FIRST, and the order is the safety property. The
-		// Authenticator contract is (false, nil) for a definitive rejection and
-		// (true|false, err) for anything transient; judging `authenticated`
-		// first would turn a backend blip into a PERMANENT 535 that makes the
-		// client discard a valid stored password. Any error => temporary 454.
+		// ERROR IS CHECKED FIRST, and the order is the safety property. Per the
+		// Authenticator contract (see server.go), (false, nil) means the account
+		// is absent and every other rejection carries an error; judging
+		// `authenticated` first would turn a backend blip into a PERMANENT 535
+		// that makes the client discard a valid stored password. Any error =>
+		// temporary 454. That covers a wrong password, an unusable stored hash,
+		// and an account denied submission: none of them prove the account is
+		// gone, and all can start working again with no change by the client.
 		if err != nil {
 			s.Logger.Error("Authentication error", "username", user, "error", err)
 			return ErrAuthTemporaryFailure
 		}
 
 		if !authenticated {
-			// Permanent: the credential was judged and rejected. RFC 4954 §6's
-			// 535 5.7.8 — a 4xx here tells the client to retry a password that
+			// Permanent: the backend has no such account. RFC 4954 §6's
+			// 535 5.7.8 — a 4xx here tells the client to retry an address that
 			// can never work, and Outlook's setup wizard reads 454 as "server
-			// unavailable" and aborts account creation instead of prompting.
-			s.Logger.Warn("Authentication failed", "username", user)
+			// unavailable" and aborts account creation instead of telling the
+			// user their address is wrong.
+			s.Logger.Warn("Authentication failed: no such account", "username", user)
 			return ErrAuthCredentialsInvalid
 		}
 

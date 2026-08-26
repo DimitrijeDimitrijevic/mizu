@@ -33,17 +33,30 @@ var (
 	// permanent 535 is a password prompt, a temporary 454 is read as "server
 	// down" and aborts account creation.
 	//
-	// ErrAuthCredentialsInvalid: the credential was judged and rejected —
-	// PERMANENT. Deliberately says nothing about which half was wrong so
-	// neither the server nor an attacker can enumerate mailboxes.
+	// ErrAuthCredentialsInvalid: the auth backend has no such account (404) —
+	// PERMANENT, because no retry makes an absent account appear. This is the
+	// ONLY permanent auth failure. An account that exists but cannot be
+	// authenticated right now — wrong password, no usable hash, denied
+	// submission — gets the 454 below instead, since all of those can change
+	// without the client altering anything.
+	//
+	// Note this is distinguishable from the 454 below, which an existing
+	// account gets when its password is wrong, so the pair is a mailbox
+	// enumeration oracle: one AUTH per address reveals which ones exist. That
+	// is an accepted trade-off — a client that cannot tell "no such address"
+	// from "server down" retries a hopeless address forever. The auth rate
+	// limiter is what bounds the probing, since these attempts are now recorded
+	// (see the RecordAuthAttempt gate in auth_session.go).
 	ErrAuthCredentialsInvalid = &smtp.SMTPError{
 		Code:         535,
 		EnhancedCode: smtp.EnhancedCode{5, 7, 8},
 		Message:      "Authentication credentials invalid",
 	}
-	// ErrAuthTemporaryFailure: the credential was never judged (backend
-	// unreachable/5xx/misconfigured) — TEMPORARY, so a stored password
-	// survives our outage instead of being discarded by the client.
+	// ErrAuthTemporaryFailure: everything that is not a missing account — a
+	// wrong password, an unusable stored hash, an account denied submission, or
+	// a backend that was unreachable/5xx/misconfigured. TEMPORARY, so a stored
+	// password survives our outage (or a lifted deny) instead of being discarded
+	// by the client.
 	ErrAuthTemporaryFailure = &smtp.SMTPError{
 		Code:         454,
 		EnhancedCode: smtp.EnhancedCode{4, 7, 0},

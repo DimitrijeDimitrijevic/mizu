@@ -187,7 +187,27 @@ type Backend struct {
 	SpamChecker SpamChecker // Optional: External spam checker (rspamd)
 }
 
-// Authenticator interface for SMTP AUTH
+// Authenticator interface for SMTP AUTH.
+//
+// Authenticate's return pair is a three-way verdict, and the session layer maps
+// it straight onto SMTP reply codes - implementations must respect it exactly:
+//
+//	(true, nil)   authenticated
+//	(false, nil)  the backend has no such account. PERMANENT: a 535 5.7.8,
+//	              because no retry can make a missing account appear.
+//	(_, err)      the account may well exist, but this attempt could not be
+//	              authenticated - wrong password, an unusable stored hash, an
+//	              account denied submission, or a backend failure. TEMPORARY:
+//	              a 454 4.7.0, so a client keeps a stored password that may
+//	              still be valid instead of discarding it.
+//
+// The dividing line is whether the ACCOUNT exists, not whether the credential
+// was correct: everything except a missing account can change without the
+// client doing anything, so only a missing account earns a permanent reply.
+//
+// The asymmetry is deliberate: err is checked first, so an implementation that
+// signals a rejection with an error can only ever be too lenient (a 4xx), never
+// too harsh. Only return (false, nil) when the account itself is absent.
 type Authenticator interface {
 	Authenticate(username, password string) (bool, error)
 	CanSendAs(authenticatedUser, fromAddress string) bool
