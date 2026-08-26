@@ -22,56 +22,25 @@ func normalizeToCRLF(s string) string {
 	return strings.ReplaceAll(s, "\n", "\r\n")
 }
 
-// HeaderStampOptions controls which trace and analysis headers a server stamps.
-// The three settings are independent: DisableMizuHeaders and OmitAnalysisHeaders
-// govern the X-Mizu-* and milter headers, StripClientIdentity governs Received.
-type HeaderStampOptions struct {
-	// DisableMizuHeaders drops every X-Mizu-* header. The Received header is
-	// still stamped, since RFC 5321 section 4.4 requires it.
-	DisableMizuHeaders bool
-
-	// OmitAnalysisHeaders drops X-Mizu-Authentication-Results, X-Mizu-Junk and the
-	// milter/rspamd spam headers, leaving only Received and X-Mizu-Trace-ID. Set on
-	// relay servers, which have no milter/rspamd to produce those verdicts.
-	OmitAnalysisHeaders bool
-
-	// StripClientIdentity omits the "from <HELO> (<client IP>)" clause from the
-	// Received header, so the submitting client's machine and network are not
-	// disclosed to recipients. See buildReceivedHeader.
-	StripClientIdentity bool
-}
-
-// headerStampOptions derives the stamping policy from a server's configuration.
-func headerStampOptions(cfg *config.ServerConfig) HeaderStampOptions {
-	return HeaderStampOptions{
-		DisableMizuHeaders: cfg.DisableMizuHeaders,
-		// A relay has no milter/rspamd, so it has no analysis verdicts to stamp.
-		OmitAnalysisHeaders: cfg.IsRelay(),
-		StripClientIdentity: cfg.StripsClientIdentity(),
-	}
-}
-
 // InjectMizuHeaders adds Received and X-Mizu-* headers to the email
 // These headers provide email tracing, authentication results, and debugging information
+// toggles selects which X-Mizu-* headers are emitted; the Received header is always added
 // spamHeaders contains additional headers from spam checking (e.g., X-Junk: yes); a key
 // may map to multiple values, which become separate header lines (e.g. Authentication-Results).
-// opts selects which of those headers are stamped; see HeaderStampOptions.
-func InjectMizuHeaders(rawEmail, domain, remoteAddr, heloHostname, traceID string, tlsVersion string, spfResult *validation.SPFResult, dmarcResult *validation.DMARCResult, arcResult *validation.ARCResult, isJunk bool, opts HeaderStampOptions, spamHeaders map[string][]string) string {
+// spamHeaders are NOT subject to toggles — rspamd's add_headers are injected verbatim.
+// stripClientIdentity omits the "from <HELO> (<client IP>)" clause from Received; see buildReceivedHeader.
+func InjectMizuHeaders(rawEmail, domain, remoteAddr, heloHostname, traceID string, tlsVersion string, spfResult *validation.SPFResult, dmarcResult *validation.DMARCResult, arcResult *validation.ARCResult, isJunk bool, toggles config.HeaderToggles, stripClientIdentity bool, spamHeaders map[string][]string) string {
 	// Build the Received header (always added)
-	receivedHeader := buildReceivedHeader(domain, remoteAddr, heloHostname, traceID, tlsVersion, opts.StripClientIdentity)
+	receivedHeader := buildReceivedHeader(domain, remoteAddr, heloHostname, traceID, tlsVersion, stripClientIdentity)
 
-	// Build X-Mizu-* headers (only if not disabled)
-	var mizuHeaders string
-	if !opts.DisableMizuHeaders {
-		mizuHeaders = buildMizuHeaders(traceID, spfResult, dmarcResult, arcResult, isJunk, opts.OmitAnalysisHeaders)
-	}
+	// Build X-Mizu-* headers (per-header toggles)
+	mizuHeaders := buildMizuHeaders(traceID, spfResult, dmarcResult, arcResult, isJunk, toggles)
 
 	// Build spam check headers (from rspamd or other spam checkers).
 	// Sanitize both name and value: although rspamd is internal, a stray CR/LF
 	// in either field would forge an arbitrary header or inject body content.
-	// Relay servers have no milter, so these are omitted entirely.
 	var spamHeaderStr string
-	if len(spamHeaders) > 0 && !opts.OmitAnalysisHeaders {
+	if len(spamHeaders) > 0 {
 		var sb strings.Builder
 		for name, values := range spamHeaders {
 			safeName := sanitizeHeaderValue(name)
@@ -97,8 +66,8 @@ func InjectMizuHeaders(rawEmail, domain, remoteAddr, heloHostname, traceID strin
 // buildReceivedHeader creates a standard Received header for email tracing
 // Format follows RFC 5321 section 4.4 (Trace Information)
 //
-// When stripClientIdentity is set - the default on submission servers, configurable
-// per server via strip_client_identity - the "from" clause is omitted entirely. The
+// When stripClientIdentity is set — the default on submission servers, configurable
+// per server via strip_client_identity — the "from" clause is omitted entirely. The
 // HELO name and the client IP identify the submitting user's machine and network,
 // and stamping them here publishes the user's home or mobile address to every
 // recipient. The trace ID stays in the header, so the hop remains correlatable with
@@ -189,24 +158,26 @@ func sanitizeFoldedHeaderValue(s string) string {
 	return sb.String()
 }
 
-// buildMizuHeaders creates custom X-Mizu-* headers for debugging and analysis.
-// X-Mizu-Trace-ID is always added. When omitAnalysisHeaders is true (relay servers),
-// the X-Mizu-Authentication-Results and X-Mizu-Junk lines are skipped.
-func buildMizuHeaders(traceID string, spfResult *validation.SPFResult, dmarcResult *validation.DMARCResult, arcResult *validation.ARCResult, isJunk bool, omitAnalysisHeaders bool) string {
+// buildMizuHeaders creates custom X-Mizu-* headers for debugging and analysis
+func buildMizuHeaders(traceID string, spfResult *validation.SPFResult, dmarcResult *validation.DMARCResult, arcResult *validation.ARCResult, isJunk bool, toggles config.HeaderToggles) string {
 	var sb strings.Builder
 
 	// X-Mizu-Trace-ID: Unique identifier for this email transaction
-	sb.WriteString("X-Mizu-Trace-ID: ")
-	sb.WriteString(traceID)
-	sb.WriteString("\r\n")
+	if toggles.TraceID {
+		sb.WriteString("X-Mizu-Trace-ID: ")
+		sb.WriteString(traceID)
+		sb.WriteString("\r\n")
+	}
 
-	if !omitAnalysisHeaders {
-		// X-Mizu-Authentication-Results: Summary of authentication results
+	// X-Mizu-Authentication-Results: Summary of authentication results
+	if toggles.AuthResults {
 		sb.WriteString("X-Mizu-Authentication-Results: ")
 		sb.WriteString(buildAuthenticationSummary(spfResult, dmarcResult, arcResult))
 		sb.WriteString("\r\n")
+	}
 
-		// X-Mizu-Junk: Spam classification
+	// X-Mizu-Junk: Spam classification
+	if toggles.Junk {
 		if isJunk {
 			sb.WriteString("X-Mizu-Junk: YES\r\n")
 		} else {

@@ -40,7 +40,7 @@ const MaxMessageSizeLimit = 100 * 1024 * 1024 // 100 MiB
 type ServerConfig struct {
 	// === Identity ===
 	Name string `toml:"name"` // Human-readable name (e.g., "mx-primary", "submission-tls")
-	Type string `toml:"type"` // "relay" (MX server) or "submission" (MSA server). Relay servers have no milter/rspamd and stamp only Received + X-Mizu-Trace-ID (X-Mizu-Authentication-Results, X-Mizu-Junk, and spam/milter headers are omitted). The type also sets the default for strip_client_identity.
+	Type string `toml:"type"` // "relay" (MX server) or "submission" (MSA server). Also sets the default for strip_client_identity (stripped on submission, kept on relay).
 
 	// === Network ===
 	ListenAddr           string       `toml:"listen_addr"`            // Address to bind (e.g., ":25", ":465", ":587", "127.0.0.1:2525")
@@ -92,17 +92,27 @@ type ServerConfig struct {
 	AdvertiseLimits bool `toml:"advertise_limits"`
 
 	// === Debugging ===
-	Debug              bool `toml:"debug"`                // Enable SMTP protocol debug logging (shows all SMTP commands and responses)
-	DisableMizuHeaders bool `toml:"disable_mizu_headers"` // Disable X-Mizu-* headers (keeps Received header, removes X-Mizu-Trace-ID, X-Mizu-Authentication-Results, X-Mizu-Junk). Note: relay servers already omit X-Mizu-Authentication-Results, X-Mizu-Junk, and spam/milter headers regardless of this flag.
+	Debug bool `toml:"debug"` // Enable SMTP protocol debug logging (shows all SMTP commands and responses)
+
+	// === Injected Header Toggles ===
+	// Per-header toggles for the X-Mizu-* headers injected before delivery.
+	// nil defaults to true (header emitted); explicit false suppresses the
+	// individual header. The Received header is always added regardless.
+	EnableTraceIDHeader     *bool `toml:"enable_trace_id_header"`     // X-Mizu-Trace-ID (default: true)
+	EnableAuthResultsHeader *bool `toml:"enable_auth_results_header"` // X-Mizu-Authentication-Results (default: true)
+	EnableJunkHeader        *bool `toml:"enable_junk_header"`         // X-Mizu-Junk (default: true). Governs only this header: junk.apply_action adds its own junk marker (e.g. X-Spam) independently
 
 	// === Privacy ===
 	// StripClientIdentity omits the "from <HELO> (<client IP>)" clause from the
-	// Received header this server stamps, so the submitting user's machine name and
-	// network are not published to recipients. The rest of the hop (server hostname,
-	// protocol, trace ID, timestamp) is preserved.
-	// Defaults to true on submission servers and false on relay servers, where
-	// downstream receivers rely on the full trace for SPF/DMARC forensics and loop
-	// detection. Set explicitly to override either default.
+	// Received header this server stamps, so the submitting client's machine name
+	// and network are not published to recipients. The rest of the hop (server
+	// hostname, protocol, trace ID, timestamp) is preserved, so the message stays
+	// correlatable with our own logs. This deliberately deviates from RFC 5321 §4.4,
+	// which recommends recording the source in the Received line.
+	// Defaults to true on submission servers (the client is an end user whose home
+	// or mobile address should not reach recipients) and false on relay servers,
+	// where downstream receivers rely on the full trace for SPF/DMARC forensics and
+	// loop detection. Set explicitly to override either default.
 	StripClientIdentity *bool `toml:"strip_client_identity"`
 
 	// === Email Validation ===
@@ -134,6 +144,22 @@ type ServerConfig struct {
 
 	// === Delivery Configuration (per-server) ===
 	Delivery DeliveryConfig `toml:"delivery"` // HTTP endpoint for email delivery
+}
+
+// HeaderToggles selects which X-Mizu-* headers are injected before delivery.
+type HeaderToggles struct {
+	TraceID     bool // X-Mizu-Trace-ID
+	AuthResults bool // X-Mizu-Authentication-Results
+	Junk        bool // X-Mizu-Junk
+}
+
+// HeaderToggles resolves the per-header enable flags (nil = true).
+func (s *ServerConfig) HeaderToggles() HeaderToggles {
+	return HeaderToggles{
+		TraceID:     s.EnableTraceIDHeader == nil || *s.EnableTraceIDHeader,
+		AuthResults: s.EnableAuthResultsHeader == nil || *s.EnableAuthResultsHeader,
+		Junk:        s.EnableJunkHeader == nil || *s.EnableJunkHeader,
+	}
 }
 
 // ServerLimitsConfig holds connection limits
@@ -428,6 +454,14 @@ func (s *ServerConfig) ApplyDefaults(defaults DefaultsConfig) {
 		s.LegacyAuthCap = &trueVal
 	}
 
+	// X-Mizu-* header toggles default to true (pointers detect unset)
+	for _, p := range []**bool{&s.EnableTraceIDHeader, &s.EnableAuthResultsHeader, &s.EnableJunkHeader} {
+		if *p == nil {
+			trueVal := true
+			*p = &trueVal
+		}
+	}
+
 	// Apply validation defaults
 	// LoopDetection defaults to true for safety (uses pointer to detect unset)
 	if s.Validation.LoopDetection == nil {
@@ -451,8 +485,8 @@ func (s *ServerConfig) ApplyDefaults(defaults DefaultsConfig) {
 	// is an end user whose network should not be disclosed to recipients, and false
 	// on relay servers, where the full trace is operationally useful downstream.
 	if s.StripClientIdentity == nil {
-		defaultVal := s.IsSubmission()
-		s.StripClientIdentity = &defaultVal
+		v := s.IsSubmission()
+		s.StripClientIdentity = &v
 	}
 }
 

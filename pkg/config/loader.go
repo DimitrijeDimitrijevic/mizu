@@ -63,9 +63,11 @@ func LoadConfig(args []string) (*Config, error) {
 	// Load configuration from file if it exists
 	if *configFile != "" {
 		if _, err := os.Stat(*configFile); err == nil {
-			if _, err := toml.DecodeFile(*configFile, cfg); err != nil {
+			md, err := toml.DecodeFile(*configFile, cfg)
+			if err != nil {
 				return nil, fmt.Errorf("failed to parse config file: %w", err)
 			}
+			warnUndecodedKeys(*configFile, md)
 		} else if !os.IsNotExist(err) {
 			return nil, fmt.Errorf("failed to stat config file: %w", err)
 		}
@@ -172,15 +174,27 @@ func SaveExample(filename string) error {
 func LoadFromFile(filename string) (*Config, error) {
 	cfg := DefaultConfig()
 
-	if _, err := toml.DecodeFile(filename, &cfg); err != nil {
+	md, err := toml.DecodeFile(filename, &cfg)
+	if err != nil {
 		return nil, fmt.Errorf("failed to parse config file '%s': %w", filename, err)
 	}
+	warnUndecodedKeys(filename, md)
 
 	// Expand ${VAR} references in secret fields, then apply env-var fallbacks
 	expandSecretEnvVars(&cfg)
 	applyEnvironmentVariables(&cfg)
 
 	return &cfg, nil
+}
+
+// warnUndecodedKeys prints a stderr warning for config keys that matched no
+// known field, so a stale key (e.g. one removed in a migration) fails loudly
+// instead of being silently ignored. Runs before logging is configured, hence
+// stderr rather than the logger.
+func warnUndecodedKeys(filename string, md toml.MetaData) {
+	for _, key := range md.Undecoded() {
+		fmt.Fprintf(os.Stderr, "WARNING: unknown config key %q in %s (ignored)\n", key, filename)
+	}
 }
 
 // GetConfigPath returns the configuration file path, checking common locations

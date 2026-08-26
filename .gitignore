@@ -22,3 +22,8 @@ test-config.toml
 
 # Local Claude Code settings
 .claude/
+
+# Node artifacts (tooling, not part of this Go project)
+node_modules/
+package.json
+package-lock.json
