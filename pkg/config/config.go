@@ -432,5 +432,20 @@ func (s *ServerConfig) Validate() error {
 		}
 	}
 
+	// Validate outgoing webhook config
+	if s.Webhook.Enabled {
+		if s.Webhook.URL == "" {
+			return errors.New("webhook.url is required when webhook.enabled=true")
+		}
+		if s.Webhook.HTTPTimeoutSeconds == 0 {
+			s.Webhook.HTTPTimeoutSeconds = 10
+		}
+		if s.Webhook.MaxRetryAttempts == 0 {
+			// Fire-and-forget by default: see webhook.NewClient on why
+			// retrying risks over-counting at the receiver.
+			s.Webhook.MaxRetryAttempts = 1
+		}
+	}
+
 	return nil
 }

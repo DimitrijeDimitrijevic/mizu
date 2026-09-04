@@ -99,6 +99,7 @@ func expandSecretEnvVars(cfg *Config) {
 		s.SenderValidation.AuthToken = expandEnvRefs(s.SenderValidation.AuthToken)
 		s.RecipientValidation.AuthToken = expandEnvRefs(s.RecipientValidation.AuthToken)
 		s.SpamCheck.Password = expandEnvRefs(s.SpamCheck.Password)
+		s.Webhook.AuthToken = expandEnvRefs(s.Webhook.AuthToken)
 	}
 }
 

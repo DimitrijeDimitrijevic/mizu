@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"mime"
 	"net"
 	"strings"
 	"time"
@@ -431,6 +432,22 @@ func generateMessageID(domain string) string {
 	randomPart := hex.EncodeToString(b)
 	timestamp := time.Now().Unix()
 	return fmt.Sprintf("<%s.%d@%s>", randomPart, timestamp, domain)
+}
+
+// decodeMIMEHeader decodes RFC 2047 encoded-words in a header value. net/mail's
+// Header.Get returns the raw value, so a non-ASCII subject would otherwise reach
+// the webhook as "=?UTF-8?B?...?=". A word the decoder cannot handle (a charset
+// outside its built-in utf-8/iso-8859-1/us-ascii set) leaves the raw value,
+// which is no worse than not decoding at all.
+func decodeMIMEHeader(v string) string {
+	if !strings.Contains(v, "=?") {
+		return v // no encoded-words; skip allocating a decoder
+	}
+	var dec mime.WordDecoder
+	if decoded, err := dec.DecodeHeader(v); err == nil {
+		return decoded
+	}
+	return v
 }
 
 // LoopDetectionResult contains the result of mail loop detection

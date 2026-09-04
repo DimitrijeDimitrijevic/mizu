@@ -23,10 +23,12 @@ import (
 	"migadu/mizu/pkg/concurrency"
 	"migadu/mizu/pkg/config"
 	"migadu/mizu/pkg/dns"
+	"migadu/mizu/pkg/logging"
 	"migadu/mizu/pkg/metrics"
 	"migadu/mizu/pkg/poster"
 	"migadu/mizu/pkg/stats"
 	"migadu/mizu/pkg/validation"
+	"migadu/mizu/pkg/webhook"
 
 	"github.com/emersion/go-msgauth/authres"
 	"github.com/emersion/go-smtp"
@@ -152,6 +154,12 @@ type SpamCheckResult struct {
 	SMTPMessage  string              // Custom SMTP reply text from rspamd (messages.smtp_message); used on reject/defer when non-empty, else a generic message
 }
 
+// WebhookNotifier posts a notification for an outgoing message that the
+// delivery backend reported as newly enqueued. Implemented by webhook.Client.
+type WebhookNotifier interface {
+	Send(ctx context.Context, p webhook.Payload) error
+}
+
 // Backend implements smtp.Backend interface for our custom SMTP server.
 // It manages the overall server configuration and creates new sessions for incoming connections.
 type Backend struct {
@@ -185,6 +193,9 @@ type Backend struct {
 
 	// Spam checking
 	SpamChecker SpamChecker // Optional: External spam checker (rspamd)
+
+	// Outgoing webhook
+	WebhookClient WebhookNotifier // Optional: Notifies an endpoint of accepted messages
 }
 
 // Authenticator interface for SMTP AUTH.
@@ -688,6 +699,7 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		senderValidator:    be.SenderValidator,    // Sender validator (nil if disabled)
 		recipientValidator: be.RecipientValidator, // Recipient validator (nil if disabled)
 		spamChecker:        be.SpamChecker,        // Spam checker (nil if disabled)
+		webhookClient:      be.WebhookClient,      // Outgoing webhook (nil if disabled)
 	}
 	session.sessionDeadline.Store(time.Now().Add(SessionDeadline).UnixNano())
 
@@ -824,6 +836,15 @@ type Session struct {
 	// Spam checking
 	spamChecker SpamChecker      // Spam checker for external spam scanning (nil if disabled)
 	spamResult  *SpamCheckResult // Result from spam check (nil if not checked)
+
+	// Outgoing webhook. Message metadata is captured while the headers are
+	// already parsed in validateHeaders rather than re-parsed at dispatch.
+	webhookClient   WebhookNotifier // Webhook notifier (nil if disabled)
+	subject         string          // Subject header, RFC 2047 decoded
+	messageID       string          // Message-ID header, angle brackets stripped
+	clientUserAgent string          // User-Agent, or X-Mailer when absent
+	ingestQueued    int             // Recipients the backend enqueued during this transaction
+	ingestDuplicate int             // Recipients the backend already held from an earlier one
 }
 
 // SMTP command states for sequence validation
@@ -1508,11 +1529,19 @@ func (s *Session) Data(ctx context.Context, r io.Reader) (err error) {
 	}
 
 	// 4. Attempt to deliver the message to the final destination.
-	if err := s.deliverMessage(cmdCtx, rawEmail); err != nil {
-		return err
+	deliverErr := s.deliverMessage(cmdCtx, rawEmail)
+
+	// 5. Notify the configured endpoint. This runs on the failure path too: a
+	// transaction that enqueued some recipients before failing has already
+	// committed those messages, and the sender's next attempt will report them
+	// as duplicates, so this is the only chance to report the message once.
+	s.dispatchWebhook()
+
+	if deliverErr != nil {
+		return deliverErr
 	}
 
-	// 5. Finalize the session by recording stats for the successful delivery.
+	// 6. Finalize the session by recording stats for the successful delivery.
 	s.finalizeSuccessfulDelivery()
 
 	return nil
@@ -2000,7 +2029,7 @@ func (s *Session) deliverToRecipient(ctx context.Context, signedEmail string, re
 	// recipient it was sent for.
 	emailForRecipient := addEnvelopeToHeader(signedEmail, recipient)
 
-	err := poster.PostEmailToDestinationWithContext(
+	ingestResult, err := poster.PostEmailToDestinationWithContext(
 		ctx,
 		emailForRecipient,
 		s.serverConfig.Delivery.URL,
@@ -2047,7 +2076,125 @@ func (s *Session) deliverToRecipient(ctx context.Context, signedEmail string, re
 		return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 4, 0}, Message: "Temporary failure, please try again later"}
 	}
 
+	// Both verdicts are successes for this recipient; they differ only in
+	// whether this transaction is the one that enqueued it. dispatchWebhook
+	// weighs the two totals to decide whether the message is new.
+	switch ingestResult {
+	case poster.IngestResultQueued:
+		s.ingestQueued++
+	case poster.IngestResultDuplicate:
+		s.ingestDuplicate++
+	}
+
 	return nil
+}
+
+// webhookDispatchBudget caps one notification's whole retry sequence. The
+// dispatch outlives the SMTP command context, which go-smtp cancels the moment
+// DATA returns, so it needs a deadline of its own.
+const webhookDispatchBudget = 2 * time.Minute
+
+// dispatchWebhook posts the outgoing notification for this message.
+//
+// It fires once per message, not once per recipient: the payload carries every
+// envelope recipient even though the message is handed to the delivery backend
+// one recipient at a time. It stays silent unless the backend reported at least
+// one recipient as newly enqueued, which is what allows a receiver to record one
+// row per message without deduplicating - a sending MTA that retries an entire
+// transaction produces no second notification.
+func (s *Session) dispatchWebhook() {
+	if s.webhookClient == nil {
+		return
+	}
+
+	// Nothing entered the queue, so there is no message to report. Either the
+	// transaction failed on its first recipient, or delivery is not configured.
+	if s.ingestQueued == 0 {
+		if s.metrics != nil {
+			s.metrics.WebhookTotal.WithLabelValues(s.serverName(), "skipped_none").Inc()
+		}
+		return
+	}
+
+	// A duplicate on any recipient proves the backend already held this message
+	// from an earlier transaction, which is the transaction that reported it.
+	// Staying silent here is what makes the notification exactly-once per
+	// message: a sender retrying after a partial failure re-presents the
+	// recipients that got through last time, and they come back as duplicates.
+	if s.ingestDuplicate > 0 {
+		s.Logger.Debug("Skipping webhook - message already reported",
+			"from", s.from,
+			"queued", s.ingestQueued,
+			"duplicate", s.ingestDuplicate)
+		if s.metrics != nil {
+			s.metrics.WebhookTotal.WithLabelValues(s.serverName(), "skipped_duplicate").Inc()
+		}
+		return
+	}
+
+	// Every recipient passed RCPT TO, so the full envelope is reported even
+	// when only some of them were enqueued by this transaction.
+	direction := "incoming"
+	if s.serverConfig.IsSubmission() {
+		direction = "outgoing"
+	}
+
+	payload := webhook.Payload{
+		TraceID:         s.traceID,
+		Direction:       direction,
+		Server:          s.serverName(),
+		MailFrom:        s.from,
+		AuthUser:        s.authenticatedUser,
+		Recipients:      slices.Clone(s.to),
+		Subject:         s.subject,
+		MessageID:       s.messageID,
+		ClientIP:        s.remoteAddr,
+		ClientUserAgent: s.clientUserAgent,
+	}
+	if s.spamResult != nil {
+		payload.SpamAction = s.spamResult.Action
+		payload.SpamScore = s.spamResult.Score
+	}
+
+	// Capture what the goroutine needs: Reset clears the session's per-message
+	// fields as soon as the next transaction starts on this connection.
+	client := s.webhookClient
+	logger := s.Logger
+	m := s.metrics
+	serverName := s.serverName()
+
+	send := func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(s.ctx), webhookDispatchBudget)
+		defer cancel()
+
+		start := time.Now()
+		err := client.Send(ctx, payload)
+		if m != nil {
+			m.WebhookDuration.Observe(time.Since(start).Seconds())
+		}
+		if err != nil {
+			logger.Error("Webhook dispatch failed", "trace_id", payload.TraceID, "error", err)
+			if m != nil {
+				m.WebhookTotal.WithLabelValues(serverName, "failed").Inc()
+			}
+			return
+		}
+		// The client logs the URL, response status and timing; keep this one
+		// at debug so a delivered webhook is not reported twice at info.
+		logger.Debug("Webhook dispatch complete", "trace_id", payload.TraceID, "recipients", len(payload.Recipients))
+		if m != nil {
+			m.WebhookTotal.WithLabelValues(serverName, "sent").Inc()
+		}
+	}
+
+	// Tracked on the session WaitGroup so graceful shutdown drains in-flight
+	// notifications instead of killing them mid-POST.
+	if s.sessionsWg != nil {
+		s.sessionsWg.Add(1)
+		logging.SafeGoWithWg(logger, "outgoing-webhook", s.sessionsWg, send)
+		return
+	}
+	logging.SafeGo(logger, "outgoing-webhook", send)
 }
 
 // finalizeSuccessfulDelivery records statistics for a successfully delivered message.
@@ -2104,6 +2251,17 @@ func (s *Session) validateHeaders(rawEmail string) error {
 	}
 
 	headers := msg.Header
+
+	// Capture the metadata the outgoing webhook reports. This is the only
+	// place the message headers are parsed, so read them here rather than
+	// parsing the message a second time at dispatch.
+	s.subject = decodeMIMEHeader(headers.Get("Subject"))
+	s.messageID = strings.Trim(headers.Get("Message-Id"), "<>")
+	s.clientUserAgent = headers.Get("User-Agent")
+	if s.clientUserAgent == "" {
+		// Older and Windows MUAs identify themselves with X-Mailer instead.
+		s.clientUserAgent = headers.Get("X-Mailer")
+	}
 
 	// Check for junk headers if configured
 	if len(s.serverConfig.Junk.CheckHeaders) > 0 {
@@ -2243,6 +2401,11 @@ func (s *Session) Reset() {
 	s.dmarcResult = nil
 	s.arcResult = nil
 	s.spamResult = nil
+	s.subject = ""
+	s.messageID = ""
+	s.clientUserAgent = ""
+	s.ingestQueued = 0
+	s.ingestDuplicate = 0
 
 	// Reset idle timeout after successful message
 	if err := s.setCommandTimeout(IdleTimeout); err != nil {

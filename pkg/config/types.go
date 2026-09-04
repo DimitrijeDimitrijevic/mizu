@@ -131,6 +131,7 @@ type ServerConfig struct {
 	DNSChecks  ServerDNSChecksConfig  `toml:"dns_checks"` // DNS validation checks (rDNS, MX)
 	Junk       ServerJunkConfig       `toml:"junk"`       // Junk/spam detection configuration
 	SpamCheck  ServerSpamCheckConfig  `toml:"spam_check"` // External spam checking (rspamd) configuration
+	Webhook    ServerWebhookConfig    `toml:"webhook"`    // Outgoing notification posted once per accepted message
 
 	// === Rate Limiting (per-server) ===
 	RateLimit   RateLimitConfig         `toml:"rate_limit"`  // Rate limiting configuration
@@ -340,6 +341,23 @@ type ServerSpamCheckConfig struct {
 	SpamHeaderValue    string `toml:"spam_header_value"`    // Header value for spam (default: "yes")
 	HamHeaderValue     string `toml:"ham_header_value"`     // Header value for ham/not spam (default: "", empty = don't add header for ham)
 	RejectOnAction     string `toml:"reject_on_action"`     // Reject message if rspamd action matches this (e.g., "reject", empty = never reject)
+}
+
+// ServerWebhookConfig configures the JSON notification posted once per message
+// that the delivery backend reports as newly enqueued.
+//
+// The notification fires only when the backend answers the delivery POST with
+// X-Ingest: queued. A backend that recognises the message as already queued
+// answers 200 with X-Ingest: duplicate and no notification is sent, so a
+// receiver can record one row per message without deduplicating. A backend that
+// sends no X-Ingest header at all never triggers a notification, since there is
+// then no way to tell a fresh enqueue from a retry.
+type ServerWebhookConfig struct {
+	Enabled            bool   `toml:"enabled"`              // Enable the outgoing webhook (default: false)
+	URL                string `toml:"url"`                  // Endpoint receiving the JSON POST
+	AuthToken          string `toml:"auth_token"`           // Optional bearer token (supports env var: ${WEBHOOK_AUTH_TOKEN})
+	HTTPTimeoutSeconds int    `toml:"http_timeout_seconds"` // Timeout for a single attempt (default: 10)
+	MaxRetryAttempts   int    `toml:"max_retry_attempts"`   // Attempts per notification, including the first (default: 1 - fire and forget)
 }
 
 // ServerTLSConfig holds TLS configuration for a server

@@ -267,6 +267,127 @@ Key packages:
 - Successful validations cached for 5 minutes (configurable)
 - Provides early rejection before DATA phase, reducing bandwidth and processing
 
+**Outgoing Webhook Configuration:**
+- `[server.webhook]` posts one JSON notification per accepted message to `url`
+- Fires **exactly once per message**, listing every envelope recipient. All
+  recipients passed RCPT TO, so the full envelope is known at DATA time even when
+  only some of them were enqueued by this transaction
+- The gate is `ingestQueued > 0 && ingestDuplicate == 0`, using the
+  `X-Ingest: queued|duplicate` verdict mailqueuer returns per recipient
+  ([pkg/poster](pkg/poster/) surfaces it). A `duplicate` on **any** recipient proves
+  an earlier transaction already reported this message, so this one stays silent.
+  That is what makes the notification safe to count on: a sender retrying after a
+  partial failure re-presents the recipients that got through last time, and they
+  come back as duplicates
+- Dispatched on **both** exit paths of `Data()`, including when delivery fails. A
+  transaction that enqueued recipients 1-3 before recipient 4 failed has already
+  committed those messages, and every later retry sees duplicates, so this is the
+  only chance to report the message
+- A backend that sends no `X-Ingest` at all never notifies: a fresh enqueue is then
+  indistinguishable from a retry
+- Dispatch is **fire-and-forget** — `logging.SafeGoWithWg` on `ActiveSessionsWg` so
+  graceful shutdown drains it, and `max_retry_attempts` defaults to **1**. The
+  payload carries no idempotency key, so a receiver counting one event per message
+  cannot distinguish a genuine retry from a first POST whose response was merely
+  lost; losing a notification to a blip beats over-counting. A webhook failure never
+  fails the SMTP transaction — the message is already queued, and failing would only
+  provoke a redundant retry of accepted mail
+- Payload: `trace_id`, `direction` (`outgoing` on submission, `incoming` on relay),
+  `server` (the `[[server]]` name — both the inbound-MX and relay tiers are
+  `type = "relay"`, so this is what separates them), `mail_from`, `auth_user` (empty
+  when unauthenticated; differs from `mail_from` whenever `allowed_from` grants an
+  alias, `*@domain` wildcard or `/regex/`), `recipients`, `subject` (RFC 2047
+  decoded), `message_id` (angle brackets stripped), `spam_action`, `spam_score`,
+  `client_ip`, `client_user_agent` (`User-Agent`, or `X-Mailer` when absent).
+  `spam_action`/`spam_score` come from `Session.spamResult`, which otherwise never
+  leaves mizu — only the boolean `X-Junk` header is forwarded downstream
+- Keys: `enabled`, `url`, `auth_token` (env: `${WEBHOOK_AUTH_TOKEN}`),
+  `http_timeout_seconds` (default 10, bounds one attempt), `max_retry_attempts`
+  (default 1). 4xx is not retried; 429 and 5xx are
+
+**How the webhook request is made:**
+
+```
+POST <webhook.url>
+Content-Type: application/json
+Authorization: Bearer <webhook.auth_token>    # omitted when auth_token is unset
+```
+
+One request per message, body below. Redirects are never followed — a 3xx is
+treated as a failure rather than forwarding the payload to an unvetted host.
+
+**Webhook JSON payload** (captured on the wire by
+`TestWebhookPayload_OnTheWire` in [pkg/smtp/webhook_dispatch_test.go](pkg/smtp/webhook_dispatch_test.go)):
+
+```json
+{
+  "trace_id": "a1b2c3d4e5f6",
+  "direction": "outgoing",
+  "server": "mizu-out",
+  "mail_from": "alias@example.com",
+  "auth_user": "sender@example.com",
+  "recipients": [
+    "r1@example.com",
+    "r2@example.com",
+    "r3@example.com"
+  ],
+  "subject": "Quarterly report",
+  "message_id": "abc@example.com",
+  "spam_action": "no action",
+  "spam_score": 1.25,
+  "client_ip": "203.0.113.7",
+  "client_user_agent": "Thunderbird"
+}
+```
+
+| field | notes |
+|---|---|
+| `trace_id` | Per SMTP transaction. A sender's retry carries a **different** one — never dedupe on it |
+| `direction` | `outgoing` on a submission server, `incoming` on a relay one |
+| `server` | The `[[server]]` name. Both inbound-MX and relay tiers are `type = "relay"`, so this is what separates them |
+| `mail_from` | Envelope sender |
+| `auth_user` | SMTP AUTH login; empty when unauthenticated. Differs from `mail_from` whenever `allowed_from` grants an alias, `*@domain` wildcard or `/regex/` |
+| `recipients` | **Every** envelope recipient, even those a partial failure has not enqueued yet |
+| `subject` | RFC 2047 decoded |
+| `message_id` | Angle brackets stripped. Client-supplied on submission, so not unique by construction |
+| `spam_action` | rspamd action (`no action`, `add header`, `greylist`, …); empty when spam checking is off |
+| `spam_score` | rspamd score; `0` when spam checking is off |
+| `client_ip` | Connecting client's IP |
+| `client_user_agent` | `User-Agent`, or `X-Mailer` when absent; empty when neither is present |
+
+**What the receiver should verify:**
+
+1. **The bearer token**, on every request, before doing anything else. It is the
+   only thing authenticating the caller — nothing in the payload is proof of origin.
+2. **`direction == "outgoing"`** before counting against a sender's outgoing quota.
+   The same endpoint will receive `incoming` events if configured on a relay tier.
+3. **Method is `POST` and `Content-Type` is `application/json`.**
+4. **Respond quickly with a 2xx.** `4xx` is treated as permanent and never retried;
+   `429`/`5xx` are retryable, but the default is a **single attempt**, so in practice
+   any non-2xx loses the notification.
+5. **Treat delivery as at-most-once.** Because the payload carries no idempotency
+   key, mizu does not retry by default — a receiver that is slow or briefly down
+   simply misses the event. Do not build on redelivery.
+6. **Count one event per message.** Mizu already guarantees exactly-once per message
+   in the normal case; the receiver does not need to deduplicate. Where that
+   guarantee thins out, see the known limit below — a receiver that wants belt and
+   braces can key on `(mail_from, message_id, recipients)`, remembering that
+   `message_id` is client-supplied and not unique by construction.
+7. **Do not treat the event as proof of delivery.** It means the message was
+   accepted and queued, not that any recipient received it.
+
+**Webhook logging:** [pkg/webhook](pkg/webhook/) logs every attempt with the
+destination `url`, the `status` the receiver returned (`0` when the request never
+got a response — DNS failure, connection refused, timeout), the `trace_id`, whether
+the failure was `retryable`, and `duration_ms`. A delivered notification logs at
+info, a failed attempt at warn, and the session logs the final outcome at debug.
+
+**Webhook known limit:** exactly-once is only as strong as mailqueuer's dedup, an
+in-process map with a 15-minute TTL. A sender retry arriving later than that, on a
+different mailqueuer instance, or after a restart, sees `queued` again — the webhook
+fires twice and those recipients are also delivered twice. If the count feeds
+user-visible quota, that argues for durable dedup via the ledger.
+
 **DNS Checks Configuration:**
 - `[server.dns_checks]` section controls connection-time DNS validation
 - `require_rdns`: Reject connections whose IP has no PTR (reverse DNS) record

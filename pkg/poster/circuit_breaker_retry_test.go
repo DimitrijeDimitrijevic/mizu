@@ -43,7 +43,7 @@ func TestCircuitBreaker_RetriesContinueWhenOpen(t *testing.T) {
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 
 	// Try to post email with 3 retry attempts
-	err := PostEmailToDestinationWithContext(
+	_, err := PostEmailToDestinationWithContext(
 		context.Background(),
 		"Subject: Test\r\n\r\nTest email",
 		backend.URL,
@@ -101,7 +101,7 @@ func TestCircuitBreaker_AllRetriesFailWithCircuitOpen(t *testing.T) {
 
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 
-	err := PostEmailToDestinationWithContext(
+	_, err := PostEmailToDestinationWithContext(
 		context.Background(),
 		"Subject: Test\r\n\r\nTest email",
 		backend.URL,
@@ -164,7 +164,7 @@ func TestCircuitBreaker_OpensButRecoversInRetryWindow(t *testing.T) {
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 
 	start := time.Now()
-	err := PostEmailToDestinationWithContext(
+	_, err := PostEmailToDestinationWithContext(
 		context.Background(),
 		"Subject: Test\r\n\r\nTest email",
 		backend.URL,

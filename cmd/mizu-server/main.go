@@ -35,6 +35,7 @@ import (
 	"migadu/mizu/pkg/stats"
 	"migadu/mizu/pkg/storage"
 	tlsmgr "migadu/mizu/pkg/tls"
+	"migadu/mizu/pkg/webhook"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -1144,6 +1145,22 @@ func createServerBackend(
 			"reject_on_action", serverCfg.SpamCheck.RejectOnAction)
 	}
 
+	// Initialize the outgoing webhook if configured. Validation already
+	// enforced url and filled the timeout/attempt defaults.
+	var webhookClient smtp.WebhookNotifier
+	if serverCfg.Webhook.Enabled {
+		webhookClient = webhook.NewClient(
+			serverCfg.Webhook.URL,
+			serverCfg.Webhook.AuthToken,
+			time.Duration(serverCfg.Webhook.HTTPTimeoutSeconds)*time.Second,
+			serverCfg.Webhook.MaxRetryAttempts,
+			serverLogger,
+		)
+		serverLogger.Info("Outgoing webhook enabled",
+			"url", serverCfg.Webhook.URL,
+			"max_retry_attempts", serverCfg.Webhook.MaxRetryAttempts)
+	}
+
 	// Create Backend
 	var activeSessionsWg sync.WaitGroup
 	var activeSessionCount atomic.Int64
@@ -1170,6 +1187,7 @@ func createServerBackend(
 		SenderValidator:    senderValidator,
 		RecipientValidator: recipientValidator,
 		SpamChecker:        spamChecker,
+		WebhookClient:      webhookClient,
 	}
 }
 

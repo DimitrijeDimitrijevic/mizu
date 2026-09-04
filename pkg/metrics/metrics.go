@@ -72,6 +72,10 @@ type Metrics struct {
 	// Spam check metrics
 	SpamCheckUp prometheus.Gauge // 1 = rspamd reachable, 0 = unreachable
 
+	// Outgoing webhook metrics
+	WebhookTotal    *prometheus.CounterVec // Labels: server, result (sent, failed, skipped_duplicate)
+	WebhookDuration prometheus.Histogram
+
 	// DNS cache metrics
 	DNSCacheHits      *prometheus.CounterVec // Labels: record_type
 	DNSCacheMisses    *prometheus.CounterVec // Labels: record_type
@@ -371,6 +375,21 @@ func New(namespace string) *Metrics {
 			Subsystem: "spam_check",
 			Name:      "up",
 			Help:      "Whether the spam check server (rspamd) is reachable (1 = up, 0 = down)",
+		}),
+
+		// Outgoing webhook metrics
+		WebhookTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: "webhook",
+			Name:      "total",
+			Help:      "Outgoing webhook dispatches by outcome",
+		}, []string{"server", "result"}),
+		WebhookDuration: promauto.NewHistogram(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Subsystem: "webhook",
+			Name:      "duration_seconds",
+			Help:      "Duration of outgoing webhook POSTs",
+			Buckets:   prometheus.DefBuckets,
 		}),
 
 		// DNS cache metrics
