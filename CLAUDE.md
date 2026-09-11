@@ -123,13 +123,18 @@ Key packages:
        (`relay`|`submission`), `X-Client-IP` (no port, PROXY-aware)
      - When set: `X-Mail-From` (empty for null sender), `X-Auth-User`
        (authenticated submission)
-     - Junk: `X-Junk: yes` plus `X-Junk-Action` (`header`|`subject`|`warn`,
-       the effective `junk.apply_action`) when the message was classified junk
+     - Junk: `X-Junk: yes` plus `X-Junk-Action` when the message was classified
+       junk. `X-Junk-Action` is the *configured* `junk.apply_action` (default
+       `header`), not an outcome: junk flagged by rspamd or DMARC on a server set
+       to `reject` is still delivered, carrying `X-Junk-Action: reject`
      - Rspamd: `X-Spam-Score` (`%.2f`) and `X-Spam-Action` (rspamd verdict,
        e.g. `no action`, `add header`, `greylist`, `reject`) only when the
        spam check ran; absent when disabled or on fail-open error
      - `X-Client-IP` is sent regardless of `strip_client_identity`, which
        governs only the recipient-visible `Received` header
+     - Go canonicalizes names on the wire (`X-Trace-Id`, `X-Client-Ip`), and its
+       client adds `Host`, `Content-Length`, `User-Agent`, `Accept-Encoding`.
+       Captured requests: [docs/rspamd-plugin-migration-plan.md](docs/rspamd-plugin-migration-plan.md) §2.1
    - **Never put client-supplied text in a delivery request header.** Go's
      transport rejects the *entire* request when any header value contains a
      control byte, so a hostile or buggy `HELO` would fail every retry and turn
