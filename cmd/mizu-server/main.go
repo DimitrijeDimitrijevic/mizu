@@ -1420,6 +1420,21 @@ func runSMTPServerInstance(ctx context.Context, serverCfg *config.ServerConfig, 
 				"max_tls_version", serverCfg.TLS.MaxTLSVersion)
 		}
 
+		// Accept legacy cipher suites on top of the secure defaults, for embedded
+		// appliances whose TLS stack predates ECDHE. Assigning CipherSuites at all
+		// is what restores suites Go disables by GODEBUG (RSA key exchange since
+		// 1.22, 3DES since 1.23): a nil list uses defaultCipherSuites, which
+		// filters them out, while any explicit list is filtered from the full
+		// supported set instead. Scoping it to one listener is the point — the
+		// GODEBUG alternative applies process-wide, to every listener and to our
+		// own outbound HTTP client.
+		if suites := serverCfg.TLS.CipherSuites(); len(suites) > 0 {
+			serverTLSConfig.CipherSuites = suites
+			logger.Warn("Server accepts legacy TLS cipher suites - these lack forward secrecy and are offered only to clients that support nothing better",
+				"server", serverCfg.Name,
+				"extra_cipher_suites", strings.Join(serverCfg.TLS.ExtraCipherSuites, ","))
+		}
+
 		// Log inbound senders that can only negotiate TLS below our floor. Go calls
 		// GetConfigForClient with the ClientHello BEFORE version negotiation rejects a
 		// too-old peer, so this captures senders that would otherwise vanish into a

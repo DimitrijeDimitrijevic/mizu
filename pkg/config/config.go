@@ -300,6 +300,11 @@ func (s *ServerConfig) Validate() error {
 		if s.TLS.MinTLSVersion == "1.3" && s.TLS.MaxTLSVersion == "1.2" {
 			return errors.New("tls.max_tls_version (1.2) cannot be lower than tls.min_tls_version (1.3)")
 		}
+		ids, err := resolveCipherSuites(s.TLS.ExtraCipherSuites)
+		if err != nil {
+			return fmt.Errorf("tls.extra_cipher_suites: %w", err)
+		}
+		s.TLS.cipherSuiteIDs = ids
 	}
 
 	// Submission servers must require auth

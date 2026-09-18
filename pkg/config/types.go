@@ -2,6 +2,7 @@ package config
 
 import (
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -349,6 +350,46 @@ type ServerTLSConfig struct {
 	Required      bool   `toml:"required"`        // Enforce TLS (reject unencrypted connections)
 	MinTLSVersion string `toml:"min_tls_version"` // Minimum TLS version: "1.2" or "1.3"
 	MaxTLSVersion string `toml:"max_tls_version"` // Maximum TLS version: "1.2" or "1.3" (empty = no cap). Set to "1.2" for Exchange Online interop.
+
+	// ExtraCipherSuites names legacy TLS 1.0-1.2 cipher suites to accept in
+	// addition to Go's secure defaults, by their Go/RFC name (e.g.
+	// "TLS_RSA_WITH_AES_128_CBC_SHA"). Empty — the normal case — leaves the
+	// defaults untouched. TLS 1.3 is unaffected: its suites are not configurable.
+	//
+	// This exists for embedded appliances whose TLS stack predates ECDHE, such as
+	// UPS network management cards, which offer only RSA key exchange and cannot
+	// be updated. Go disabled RSA key exchange by default in 1.22 and 3DES in
+	// 1.23, so such a client shares no suite with us and fails STARTTLS outright.
+	// Naming a suite here restores it for this listener only.
+	ExtraCipherSuites []string `toml:"extra_cipher_suites"`
+
+	cipherSuiteIDs []uint16 // ExtraCipherSuites resolved by Validate
+}
+
+// CipherSuites returns the TLS 1.0-1.2 cipher suites this listener accepts:
+// Go's secure defaults plus the resolved extra_cipher_suites. It returns nil
+// when no extras are configured, leaving crypto/tls on its own defaults.
+//
+// The union is what makes this safe to enable: assigning only the named suites
+// would silently drop ECDHE for every other client on the listener. Nor can a
+// legacy entry cost a modern sender forward secrecy — crypto/tls ranks every
+// ECDHE suite above every RSA key exchange one and picks the first the client
+// also offers, so an extra suite is reachable only by a client that offers
+// nothing better.
+//
+// Populated by ServerConfig.Validate.
+func (t *ServerTLSConfig) CipherSuites() []uint16 {
+	if len(t.cipherSuiteIDs) == 0 {
+		return nil
+	}
+	suites := make([]uint16, 0, len(secureCipherSuiteIDs)+len(t.cipherSuiteIDs))
+	suites = append(suites, secureCipherSuiteIDs...)
+	for _, id := range t.cipherSuiteIDs {
+		if !slices.Contains(suites, id) {
+			suites = append(suites, id)
+		}
+	}
+	return suites
 }
 
 // ProxyTrustedNets returns the parsed proxy_protocol_trusted networks.

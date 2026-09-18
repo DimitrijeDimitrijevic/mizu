@@ -430,6 +430,40 @@ Key packages:
   ([pkg/smtp/headers.go](pkg/smtp/headers.go)). Independent of the X-Mizu-*
   toggles above — it governs only the `Received` `from` clause.
 
+**Legacy cipher suites (`[server.tls] extra_cipher_suites`):**
+- Per-server list of TLS 1.0-1.2 suites to accept **in addition to** Go's secure
+  defaults, named as in `tls.CipherSuites()`/`tls.InsecureCipherSuites()` (e.g.
+  `extra_cipher_suites = ["TLS_RSA_WITH_AES_128_CBC_SHA"]`). Empty everywhere
+  except where an appliance needs it. TLS 1.3 is unaffected — Go does not make
+  its suites configurable.
+- **Assigning `CipherSuites` at all is the mechanism.** Go gates its disabled
+  suites by GODEBUG (RSA key exchange since 1.22, 3DES since 1.23) *only* on the
+  nil path: `defaultCipherSuites()` filters them out, while any explicit list is
+  filtered from the full supported set instead. So naming a suite restores it
+  for that listener with no process-wide `GODEBUG=tlsrsakex=1`, which would also
+  hit every other listener and our own outbound HTTP client.
+- **Additive, never substituted** (`ServerTLSConfig.CipherSuites()`,
+  [pkg/config/types.go](pkg/config/types.go)). Assigning only the named suites
+  would silently drop ECDHE for every other client on the listener. It cannot
+  downgrade a modern sender regardless: `cipherSuitesPreferenceOrder` ranks every
+  ECDHE suite above every RSA key exchange one and the server picks the first the
+  client also offers, so a legacy suite is reachable only by a client offering
+  nothing better. `TestLegacyClientHandshake` asserts all three properties
+  against real handshakes.
+- Why it exists: embedded appliances whose TLS stack predates ECDHE — a UPS
+  network management card offered only RSA/DHE with CBC/3DES/RC4/DES, sharing no
+  suite with Go's defaults, and failed STARTTLS on submission (2026-09-17). Such
+  a client still negotiates TLS 1.2, so **do not lower `min_tls_version` for
+  this** — the cipher list is the whole problem.
+- Requires an **RSA** certificate, since RSA key exchange cannot be negotiated
+  against an ECDSA one. That works out: the leader maintains both key types, and
+  such a client offers no ECDSA suite, which is exactly how autocert (and
+  `certHello`) selects the `+rsa` cache entry — including through the SNI-less
+  default-domain fallback, which copies the hello and overrides only `ServerName`.
+- Cost is forward secrecy, so credentials sent over such a session become
+  decryptable if that RSA key later leaks. Give an appliance its own credential.
+  Unknown suite names fail startup; enabled ones log a `Warn` at listener setup.
+
 **Authentication Configuration (for submission servers):**
 - `[server.auth]` section configures SMTP AUTH for ports 587/465
 - `enabled`: Enable SMTP AUTH (advertise AUTH in EHLO response)
