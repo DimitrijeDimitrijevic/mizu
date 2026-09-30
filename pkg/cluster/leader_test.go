@@ -1,12 +1,14 @@
 package cluster
 
 import (
+	"context"
+	"fmt"
 	"io"
-
+	"log/slog"
+	"net"
+	"sync/atomic"
 	"testing"
 	"time"
-
-	"log/slog"
 )
 
 func TestLeaderElection_SingleNode(t *testing.T) {
@@ -260,3 +262,345 @@ func TestLeaderElection_LeaderFailover(t *testing.T) {
 		t.Errorf("Expected new leader to be 'node-b', got '%s'", c2.GetLeader())
 	}
 }
+
+// waitFor polls cond until it holds or the timeout passes.
+func waitFor(timeout time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return cond()
+}
+
+// A node that cannot reach its configured peers is the only member it knows of.
+// It must not elect itself on that view until the grace period has passed.
+func TestLeaderElection_UnreachablePeersDelayLeadership(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	c, err := NewCluster(Config{
+		NodeName:          "node-a",
+		BindAddr:          "127.0.0.1",
+		BindPort:          17960,
+		Peers:             []string{"127.0.0.1:17961"}, // nothing listens here
+		Logger:            logger,
+		LeaderGracePeriod: 1500 * time.Millisecond,
+		RejoinInterval:    time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create cluster: %v", err)
+	}
+	defer c.Shutdown()
+
+	if c.IsLeader() || c.GetLeader() != "" {
+		t.Errorf("lone node claimed a leader before confirming membership: leader=%q", c.GetLeader())
+	}
+
+	// Its peers really are down: it has to be able to act alone eventually.
+	if !waitFor(5*time.Second, c.IsLeader) {
+		t.Errorf("lone node never became leader after the grace period")
+	}
+}
+
+// Regression: memberlist never retries a join, so nodes started at the same
+// moment could miss each other and each remain a single-node cluster - each one
+// leader - until restarted.
+func TestLeaderElection_RejoinsAfterMissedJoin(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// node-b starts first; its only peer is not up yet, so the initial join fails.
+	c2, err := NewCluster(Config{
+		NodeName:          "node-b",
+		BindAddr:          "127.0.0.1",
+		BindPort:          17963,
+		Peers:             []string{"127.0.0.1:17962"},
+		Logger:            logger,
+		LeaderGracePeriod: time.Hour,
+		RejoinInterval:    200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create cluster 2: %v", err)
+	}
+	defer c2.Shutdown()
+
+	if c2.IsLeader() {
+		t.Fatalf("node-b elected itself while alone")
+	}
+
+	// node-a comes up without knowing node-b: only node-b's retry can connect them.
+	c1, err := NewCluster(Config{
+		NodeName: "node-a",
+		BindAddr: "127.0.0.1",
+		BindPort: 17962,
+		Peers:    []string{},
+		Logger:   logger,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create cluster 1: %v", err)
+	}
+	defer c1.Shutdown()
+
+	if !waitFor(5*time.Second, func() bool { return c2.GetLeader() == "node-a" }) {
+		t.Fatalf("node-b never rejoined: members=%d leader=%q", c2.NumMembers(), c2.GetLeader())
+	}
+	if c2.IsLeader() {
+		t.Errorf("node-b is leader, want node-a")
+	}
+	if !c1.IsLeader() {
+		t.Errorf("node-a is not leader")
+	}
+}
+
+// Confirmation was a one-way latch, so a node that had once seen the cluster
+// went on electing itself after losing sight of it. A partition therefore gave
+// both sides a leader, and with leadership the only thing standing between a
+// node and Let's Encrypt, both sides order - which is the rate-limit exhaustion
+// this whole change exists to prevent.
+func TestLeaderElection_IsolatedNodeStandsDown(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	c1, err := NewCluster(Config{
+		NodeName: "node-a", BindAddr: "127.0.0.1", BindPort: 17970,
+		Peers: []string{"127.0.0.1:17971"}, Logger: logger,
+		LeaderGracePeriod: time.Hour, RejoinInterval: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create cluster 1: %v", err)
+	}
+	defer c1.Shutdown()
+
+	c2, err := NewCluster(Config{
+		NodeName: "node-b", BindAddr: "127.0.0.1", BindPort: 17971,
+		Peers: []string{"127.0.0.1:17970"}, Logger: logger,
+		LeaderGracePeriod: time.Hour, RejoinInterval: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create cluster 2: %v", err)
+	}
+	defer c2.Shutdown()
+
+	if !waitFor(5*time.Second, func() bool { return c2.NumMembers() == 2 && c1.IsLeader() }) {
+		t.Fatalf("setup: cluster did not form (c1.leader=%q members=%d)", c1.GetLeader(), c1.NumMembers())
+	}
+
+	// node-a disappears. node-b is left alone with a peer it cannot reach.
+	c1.Shutdown()
+
+	if !waitFor(10*time.Second, func() bool { return c2.NumMembers() == 1 }) {
+		t.Fatalf("setup: node-b still sees %d members", c2.NumMembers())
+	}
+
+	// It must not appoint itself: from here it cannot tell a dead peer from a
+	// partition, and the other side may still be serving with a leader.
+	if c2.IsLeader() {
+		t.Error("the isolated node elected itself; a partition would give the cluster two leaders")
+	}
+	if leader := c2.GetLeader(); leader != "" {
+		t.Errorf("GetLeader = %q, want no leader while the cluster cannot be seen", leader)
+	}
+}
+
+// The rejoin retried only while the node was alone. memberlist drops a dead
+// node after 30s and never reconnects it on its own, so a partition that left
+// no side alone (2|2) never healed — and with a majority required to lead, the
+// whole cluster stayed leaderless until a restart.
+func TestLeaderElection_RejoinsWhileMembersAreMissing(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ports := []int{17980, 17981, 17982}
+	peersOf := func(self int) []string {
+		var peers []string
+		for _, p := range ports {
+			if p != self {
+				peers = append(peers, fmt.Sprintf("127.0.0.1:%d", p))
+			}
+		}
+		return peers
+	}
+	names := []string{"node-a", "node-b", "node-c"}
+	nodes := make([]*Cluster, 3)
+	for i := range ports {
+		c, err := NewCluster(Config{
+			NodeName: names[i], BindAddr: "127.0.0.1", BindPort: ports[i],
+			Peers: peersOf(ports[i]), Logger: logger,
+			LeaderGracePeriod: time.Hour, RejoinInterval: 200 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("Failed to create %s: %v", names[i], err)
+		}
+		nodes[i] = c
+		defer c.Shutdown()
+	}
+	if !waitFor(5*time.Second, func() bool { return nodes[2].NumMembers() == 3 && nodes[0].IsLeader() }) {
+		t.Fatalf("setup: cluster did not form")
+	}
+
+	// node-c drops out; the other two still see each other, so neither is alone.
+	nodes[2].Shutdown()
+	if !waitFor(10*time.Second, func() bool { return nodes[0].NumMembers() == 2 && nodes[1].NumMembers() == 2 }) {
+		t.Fatalf("setup: node-c still counted")
+	}
+
+	// It comes back knowing nobody: only the others' retries can reconnect it.
+	c, err := NewCluster(Config{
+		NodeName: "node-c", BindAddr: "127.0.0.1", BindPort: ports[2],
+		Peers: []string{}, Logger: logger,
+	})
+	if err != nil {
+		t.Fatalf("Failed to recreate node-c: %v", err)
+	}
+	defer c.Shutdown()
+
+	if !waitFor(10*time.Second, func() bool { return c.GetLeader() == "node-a" }) {
+		t.Fatalf("node-c was never rejoined: members=%d leader=%q", c.NumMembers(), c.GetLeader())
+	}
+}
+
+// A peers list that includes this node — memberlist tolerates joining yourself
+// — made the majority one member too many, so one node down for a reboot left
+// the survivors unable to lead.
+func TestQuorumIgnoresThisNodeInThePeerList(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c, err := NewCluster(Config{
+		NodeName: "node-a", BindAddr: "127.0.0.1", BindPort: 17990,
+		Peers:  []string{"localhost:17990", "127.0.0.1:17990", "127.0.0.1:17991", "127.0.0.1:17992"},
+		Logger: logger, LeaderGracePeriod: time.Hour, RejoinInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create cluster: %v", err)
+	}
+	defer c.Shutdown()
+
+	if got := c.quorum(); got != 2 {
+		t.Errorf("quorum = %d for a cluster of three, want 2 (peers kept: %v)", got, c.peers)
+	}
+}
+
+// The majority is counted one node per distinct peers entry. Addresses are
+// TEST-NET (192.0.2.0/24) and the local set is injected, so the machine running
+// the test cannot change the answer.
+func TestClusterSizeCountsOneNodePerDistinctEntry(t *testing.T) {
+	local := map[string]bool{"192.0.2.1": true, "2001:db8::1": true}
+	lookup := func(host string) ([]net.IP, error) {
+		switch host {
+		case "me.test": // dual-stack, both addresses this node's
+			return []net.IP{net.ParseIP("192.0.2.1"), net.ParseIP("2001:db8::1")}, nil
+		case "b.test": // dual-stack peer
+			return []net.IP{net.ParseIP("192.0.2.2"), net.ParseIP("2001:db8::2")}, nil
+		case "cluster.test": // a shared name, this node among others
+			return []net.IP{net.ParseIP("192.0.2.1"), net.ParseIP("192.0.2.2")}, nil
+		}
+		return nil, fmt.Errorf("no such host %q", host)
+	}
+
+	cases := []struct {
+		name  string
+		peers []string
+		size  int
+		self  int
+	}{
+		{"one entry per peer", []string{"192.0.2.2:7946", "192.0.2.3:7946"}, 3, 0},
+		{"this node listed", []string{"192.0.2.1:7946", "me.test:7946", "192.0.2.2:7946", "192.0.2.3:7946"}, 3, 2},
+		{"a peer with and without the port", []string{"192.0.2.2", "192.0.2.2:7946", "192.0.2.3:7946"}, 3, 0},
+		{"a dual-stack peer is one node", []string{"b.test:7946", "192.0.2.3:7946"}, 3, 0},
+		{"a shared name is one entry, not this node", []string{"cluster.test:7946"}, 2, 0},
+		{"unresolvable counts once", []string{"gone.test:7946", "GONE.test:7946", "192.0.2.2:7946"}, 3, 0},
+		{"same address, other port", []string{"192.0.2.1:7947"}, 2, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			size, self := clusterSize(tc.peers, local, 7946, lookup)
+			if size != tc.size || len(self) != tc.self {
+				t.Errorf("clusterSize = %d (self %v), want %d with %d self entries", size, self, tc.size, tc.self)
+			}
+		})
+	}
+}
+
+// Duplicates were removed only when a self entry was dropped too, so [b, c, c]
+// counted a cluster of four: a majority of three, and a rejoin that never
+// stopped retrying.
+func TestPeerListDuplicatesDoNotInflateQuorum(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c, err := NewCluster(Config{
+		NodeName: "node-a", BindAddr: "127.0.0.1", BindPort: 17993,
+		Peers:  []string{"127.0.0.1:17994", "127.0.0.1:17995", "127.0.0.1:17995"},
+		Logger: logger, LeaderGracePeriod: time.Hour, RejoinInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create cluster: %v", err)
+	}
+	defer c.Shutdown()
+
+	if got := c.quorum(); got != 2 {
+		t.Errorf("quorum = %d for a cluster of three, want 2 (peers kept: %v)", got, c.peers)
+	}
+}
+
+// countingHandler counts log records carrying a given message.
+type countingHandler struct {
+	msg string
+	n   atomic.Int32
+}
+
+func (h *countingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *countingHandler) Handle(_ context.Context, r slog.Record) error {
+	if r.Message == h.msg {
+		h.n.Add(1)
+	}
+	return nil
+}
+func (h *countingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *countingHandler) WithGroup(string) slog.Handler      { return h }
+
+// With a peer down for maintenance the rejoin runs every interval, and
+// memberlist calls it a success as soon as one live peer answers. Logging each
+// one buried the real rejoins; logging nothing hid a peer that never comes back.
+// A missing member is reported once past the startup grace, then rate-limited.
+func TestRejoinReportsAMissingMemberOnce(t *testing.T) {
+	rejoined := &countingHandler{msg: "rejoined cluster"}
+	missing := &countingHandler{msg: "cluster members missing - retrying the join"}
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	b, err := NewCluster(Config{
+		NodeName: "node-b", BindAddr: "127.0.0.1", BindPort: 17997,
+		Peers: []string{}, Logger: quiet,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create node-b: %v", err)
+	}
+	defer b.Shutdown()
+
+	a, err := NewCluster(Config{
+		NodeName: "node-a", BindAddr: "127.0.0.1", BindPort: 17996,
+		Peers:  []string{"127.0.0.1:17997", "127.0.0.1:17998"}, // node-c is down
+		Logger: slog.New(multiHandler{rejoined, missing}), LeaderGracePeriod: 300 * time.Millisecond,
+		RejoinInterval: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create node-a: %v", err)
+	}
+	defer a.Shutdown()
+
+	time.Sleep(1500 * time.Millisecond)
+	if n := rejoined.n.Load(); n > 0 {
+		t.Errorf("logged %d rejoins while membership never changed", n)
+	}
+	if n := missing.n.Load(); n != 1 {
+		t.Errorf("reported the missing member %d times, want once", n)
+	}
+}
+
+// multiHandler fans a record out to several handlers.
+type multiHandler []slog.Handler
+
+func (m multiHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (m multiHandler) Handle(ctx context.Context, r slog.Record) error {
+	for _, h := range m {
+		h.Handle(ctx, r)
+	}
+	return nil
+}
+func (m multiHandler) WithAttrs([]slog.Attr) slog.Handler { return m }
+func (m multiHandler) WithGroup(string) slog.Handler      { return m }

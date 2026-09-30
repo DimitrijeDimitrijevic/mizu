@@ -1,7 +1,10 @@
 package cluster
 
 import (
+	"context"
 	"io"
+	"strconv"
+	"strings"
 
 	"encoding/json"
 	"fmt"
@@ -62,6 +65,16 @@ type Cluster struct {
 	leaderMtx sync.RWMutex
 	metrics   *metrics.Metrics // optional; publishes the cluster leader gauge
 
+	// Membership confirmation (see membershipConfirmed)
+	peers             []string
+	startedAt         time.Time
+	leaderGracePeriod time.Duration
+	rejoinInterval    time.Duration
+	sawPeer           bool // guarded by leaderMtx; true once another member has been seen
+	// expected is how many nodes the peers list describes, this one included
+	// (see clusterSize). Set once, before anything reads it.
+	expected int
+
 	// Lifecycle
 	done         chan struct{} // Closed on Shutdown to stop background goroutines
 	shutdownOnce sync.Once     // Ensures Shutdown runs exactly once
@@ -77,7 +90,19 @@ type Config struct {
 	Logger        *slog.Logger
 	StateDelegate StateDelegate
 	EventDelegate EventDelegate
+
+	// LeaderGracePeriod is how long a node that has peers configured but has not
+	// reached any of them waits before it may act as leader (default 1 minute).
+	LeaderGracePeriod time.Duration
+	// RejoinInterval is how often a node that is alone retries joining its
+	// configured peers (default 15 seconds).
+	RejoinInterval time.Duration
 }
+
+const (
+	defaultLeaderGracePeriod = time.Minute
+	defaultRejoinInterval    = 15 * time.Second
+)
 
 // NewCluster creates a new cluster instance with memberlist
 func NewCluster(cfg Config) (*Cluster, error) {
@@ -86,10 +111,20 @@ func NewCluster(cfg Config) (*Cluster, error) {
 	}
 
 	cluster := &Cluster{
-		logger:        cfg.Logger,
-		stateDelegate: cfg.StateDelegate,
-		eventDelegate: cfg.EventDelegate,
-		done:          make(chan struct{}),
+		logger:            cfg.Logger,
+		stateDelegate:     cfg.StateDelegate,
+		eventDelegate:     cfg.EventDelegate,
+		done:              make(chan struct{}),
+		peers:             cfg.Peers,
+		startedAt:         time.Now(),
+		leaderGracePeriod: cfg.LeaderGracePeriod,
+		rejoinInterval:    cfg.RejoinInterval,
+	}
+	if cluster.leaderGracePeriod <= 0 {
+		cluster.leaderGracePeriod = defaultLeaderGracePeriod
+	}
+	if cluster.rejoinInterval <= 0 {
+		cluster.rejoinInterval = defaultRejoinInterval
 	}
 
 	// Create memberlist configuration
@@ -154,13 +189,41 @@ func NewCluster(cfg Config) (*Cluster, error) {
 	cluster.ml = ml
 	cluster.leaderMtx.Unlock()
 
-	// Join peers if provided
+	// The majority a leader needs is counted from the peers list: one node per
+	// distinct entry, less entries that name this node (memberlist tolerates
+	// joining yourself). Join still gets the list as written.
+	localIPs := map[string]bool{ml.LocalNode().Addr.String(): true}
+	if addrs, err := net.InterfaceAddrs(); err == nil {
+		for _, addr := range addrs {
+			if ipNet, ok := addr.(*net.IPNet); ok {
+				localIPs[ipNet.IP.String()] = true
+			}
+		}
+	}
+	size, self := clusterSize(cfg.Peers, localIPs, int(ml.LocalNode().Port), lookupPeer)
+	cluster.leaderMtx.Lock()
+	cluster.expected = size
+	cluster.leaderMtx.Unlock()
+	if len(self) > 0 {
+		cfg.Logger.Warn("cluster peers list names this node - not counted as a peer", "entries", self)
+	}
 	if len(cfg.Peers) > 0 {
-		_, err := ml.Join(cfg.Peers)
+		cfg.Logger.Info("cluster size taken from the peers list",
+			"nodes", size, "peers_entries", len(cfg.Peers))
+	}
+
+	// Join peers if provided
+	if len(cluster.peers) > 0 {
+		_, err := ml.Join(cluster.peers)
 		if err != nil {
 			cfg.Logger.Warn("Failed to join some peers", "error", err)
 			// Don't fail completely - we might be the first node
 		}
+
+		// memberlist never retries a join. Without this, nodes restarted at the
+		// same moment can each miss the other's listener and stay one-member
+		// clusters - every one of them leader - until the next restart.
+		concurrency.SafeGo(cfg.Logger, "cluster-rejoin", cluster.rejoinLoop)
 	}
 
 	// Initialize leader election
@@ -323,7 +386,8 @@ func (c *Cluster) Shutdown() error {
 // --- Leader Election ---
 
 // IsLeader returns true if this node is the cluster leader
-// Leader is determined by lexicographic ordering of node names (deterministic)
+// Leader is determined by lexicographic ordering of node names (deterministic).
+// No node is leader while its membership is unconfirmed (see membershipConfirmed).
 func (c *Cluster) IsLeader() bool {
 	c.leaderMtx.RLock()
 	defer c.leaderMtx.RUnlock()
@@ -356,6 +420,28 @@ func (c *Cluster) updateLeader() {
 		return
 	}
 
+	if !c.canLead(len(members)) {
+		// Stand down rather than keep a stale claim: whoever can still see a
+		// majority is entitled to lead, and this node cannot tell whether that
+		// is happening on the other side of a partition.
+		hadLeader := c.leader
+		c.leader = ""
+		m := c.metrics
+		localName := c.ml.LocalNode().Name
+		c.leaderMtx.Unlock()
+
+		if hadLeader != "" {
+			c.logger.Warn("cluster: too few members visible to elect a leader - standing down",
+				"previous_leader", hadLeader,
+				"visible_members", len(members),
+				"cluster_nodes", c.expected)
+		}
+		if m != nil && m.ClusterLeader != nil {
+			m.ClusterLeader.WithLabelValues(localName).Set(0)
+		}
+		return
+	}
+
 	// Sort members by node name lexicographically
 	sort.Slice(members, func(i, j int) bool {
 		return members[i].Name < members[j].Name
@@ -384,6 +470,167 @@ func (c *Cluster) updateLeader() {
 		}
 		m.ClusterLeader.WithLabelValues(localName).Set(v)
 	}
+}
+
+// canLead reports whether this node's view of the cluster is good enough to act
+// as leader. Must be called with leaderMtx held.
+//
+// Leadership is the only thing standing between a node and the certificate
+// authority, so a node that cannot see the cluster must not claim it. Two
+// different situations have to be told apart:
+//
+//   - It has never seen a peer. It is the only member it knows of, and the
+//     smallest name in a list of one is its own, so it would elect itself on no
+//     evidence. It waits. After leaderGracePeriod it proceeds anyway: a node
+//     whose peers really are absent — a fresh cluster, a single-node install
+//     with stale config — must still be able to obtain certificates.
+//
+//   - It has seen the cluster and now sees less of it. That is a partition or a
+//     mass failure, and it cannot tell which. A majority is required, so that at
+//     most one side of a partition has a leader. The minority keeps serving what
+//     it holds; only issuing and renewing stop, and those have weeks of slack.
+func (c *Cluster) canLead(numMembers int) bool {
+	if len(c.peers) == 0 {
+		return true
+	}
+
+	if c.sawPeer {
+		return numMembers >= c.quorum()
+	}
+
+	switch {
+	case numMembers > 1:
+		c.logger.Info("cluster membership confirmed", "members", numMembers)
+		c.sawPeer = true
+		return true
+	case time.Since(c.startedAt) >= c.leaderGracePeriod:
+		c.logger.Warn("no configured peer reachable - proceeding as a single-node cluster",
+			"peers", c.peers,
+			"waited", c.leaderGracePeriod)
+		return true
+	default:
+		return false
+	}
+}
+
+// quorum is the number of visible members a leader needs: a majority of the
+// cluster the peers list describes, counting this node.
+func (c *Cluster) quorum() int {
+	return c.expected/2 + 1
+}
+
+// missingPeerWarnInterval is how often a node that keeps missing members says so.
+const missingPeerWarnInterval = 10 * time.Minute
+
+// rejoinLoop retries joining the configured peers for as long as any of them
+// is missing. memberlist drops a dead node after 30s and never reconnects it on
+// its own, so this is what heals a partition once the network is back - and
+// retrying only while alone was not enough: a partition that left no side alone
+// (two and two) never healed, and with a majority required to lead, the whole
+// cluster stayed leaderless until a restart.
+//
+// A successful join is not logged here: memberlist calls a join successful as
+// soon as one live peer answers, so with a node down every retry "succeeds".
+// NotifyJoin logs each member that actually comes back. What is logged is a
+// member missing for longer than the startup grace - a peer with the wrong
+// port or gossip key is otherwise silent - repeated every
+// missingPeerWarnInterval while it lasts.
+func (c *Cluster) rejoinLoop() {
+	ticker := time.NewTicker(c.rejoinInterval)
+	defer ticker.Stop()
+
+	var missingSince, lastWarn time.Time
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-ticker.C:
+			members := c.ml.NumMembers()
+			if members >= c.expected {
+				if !lastWarn.IsZero() {
+					c.logger.Info("cluster membership complete again", "members", members)
+				}
+				missingSince, lastWarn = time.Time{}, time.Time{}
+				continue
+			}
+
+			if missingSince.IsZero() {
+				missingSince = time.Now()
+			}
+			if time.Since(missingSince) >= c.leaderGracePeriod && time.Since(lastWarn) >= missingPeerWarnInterval {
+				c.logger.Warn("cluster members missing - retrying the join",
+					"members", members, "expected", c.expected,
+					"missing_for", time.Since(missingSince).Round(time.Second), "peers", c.peers)
+				lastWarn = time.Now()
+			}
+
+			if _, err := c.ml.Join(c.peers); err != nil {
+				c.logger.Debug("cluster rejoin failed", "peers", c.peers, "error", err)
+			}
+		}
+	}
+}
+
+// peerLookupTimeout bounds each name lookup clusterSize makes at start.
+const peerLookupTimeout = 2 * time.Second
+
+func lookupPeer(host string) ([]net.IP, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), peerLookupTimeout)
+	defer cancel()
+	return net.DefaultResolver.LookupIP(ctx, "ip", host)
+}
+
+// clusterSize works out how many nodes a peers list describes, this node
+// included: one per distinct entry, plus one. Entries are compared after
+// normalising - lower case, the port made explicit, an IP in canonical form -
+// so "192.0.2.2" and "192.0.2.2:7946" are one peer. Names are resolved for one
+// purpose only: an entry whose every address is this node's, at this node's
+// port, is this node and is not counted. One that does not resolve is counted:
+// a peer that cannot be resolved is still a peer.
+//
+// Counting anything cleverer than entries went wrong every way it was tried.
+// Counting resolved addresses made a dual-stack peer (A and AAAA) two nodes;
+// flooring at the most members ever seen kept a decommissioned node in the
+// count until every survivor was restarted. So the rule is plain, and it holds
+// for the one way the list should be written - every other node once, by
+// address, which is what the ansible template does. One DNS name for the whole
+// cluster counts as one peer and undercounts the majority; do not use one.
+//
+// self lists the entries that name this node.
+func clusterSize(peers []string, localIPs map[string]bool, localPort int, lookup func(string) ([]net.IP, error)) (size int, self []string) {
+	distinct := make(map[string]bool)
+	for _, peer := range peers {
+		host, port := peer, localPort // memberlist's default is its own bind port
+		if h, p, err := net.SplitHostPort(peer); err == nil {
+			host = h
+			if n, err := strconv.Atoi(p); err == nil {
+				port = n
+			}
+		}
+		host = strings.ToLower(host)
+
+		var ips []net.IP
+		if ip := net.ParseIP(host); ip != nil {
+			host = ip.String()
+			ips = []net.IP{ip}
+		} else if resolved, err := lookup(host); err == nil {
+			ips = resolved
+		}
+
+		isSelf := port == localPort && len(ips) > 0
+		for _, ip := range ips {
+			if !localIPs[ip.String()] {
+				isSelf = false
+				break
+			}
+		}
+		if isSelf {
+			self = append(self, peer)
+			continue
+		}
+		distinct[net.JoinHostPort(host, strconv.Itoa(port))] = true
+	}
+	return len(distinct) + 1, self
 }
 
 // SetMetrics attaches the metrics instance so the cluster can publish the
