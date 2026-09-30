@@ -1,8 +1,10 @@
 package cluster
 
 import (
+	"context"
 	"io"
 	"strconv"
+	"strings"
 
 	"encoding/json"
 	"fmt"
@@ -69,6 +71,9 @@ type Cluster struct {
 	leaderGracePeriod time.Duration
 	rejoinInterval    time.Duration
 	sawPeer           bool // guarded by leaderMtx; true once another member has been seen
+	// expected is how many nodes the peers list describes, this one included
+	// (see clusterSize). Set once, before anything reads it.
+	expected int
 
 	// Lifecycle
 	done         chan struct{} // Closed on Shutdown to stop background goroutines
@@ -184,14 +189,27 @@ func NewCluster(cfg Config) (*Cluster, error) {
 	cluster.ml = ml
 	cluster.leaderMtx.Unlock()
 
-	// A peers list that names this node - memberlist tolerates joining yourself
-	// - would make the majority one member too many, so one node down for a
-	// reboot left the survivors unable to lead.
-	if kept, dropped := withoutSelf(cfg.Peers, ml.LocalNode(), mlConfig.BindPort); len(dropped) > 0 {
-		cfg.Logger.Warn("cluster peers list names this node - ignoring those entries", "ignored", dropped)
-		cluster.leaderMtx.Lock()
-		cluster.peers = kept
-		cluster.leaderMtx.Unlock()
+	// The majority a leader needs is counted from the peers list: one node per
+	// distinct entry, less entries that name this node (memberlist tolerates
+	// joining yourself). Join still gets the list as written.
+	localIPs := map[string]bool{ml.LocalNode().Addr.String(): true}
+	if addrs, err := net.InterfaceAddrs(); err == nil {
+		for _, addr := range addrs {
+			if ipNet, ok := addr.(*net.IPNet); ok {
+				localIPs[ipNet.IP.String()] = true
+			}
+		}
+	}
+	size, self := clusterSize(cfg.Peers, localIPs, int(ml.LocalNode().Port), lookupPeer)
+	cluster.leaderMtx.Lock()
+	cluster.expected = size
+	cluster.leaderMtx.Unlock()
+	if len(self) > 0 {
+		cfg.Logger.Warn("cluster peers list names this node - not counted as a peer", "entries", self)
+	}
+	if len(cfg.Peers) > 0 {
+		cfg.Logger.Info("cluster size taken from the peers list",
+			"nodes", size, "peers_entries", len(cfg.Peers))
 	}
 
 	// Join peers if provided
@@ -416,7 +434,7 @@ func (c *Cluster) updateLeader() {
 			c.logger.Warn("cluster: too few members visible to elect a leader - standing down",
 				"previous_leader", hadLeader,
 				"visible_members", len(members),
-				"configured_peers", len(c.peers))
+				"cluster_nodes", c.expected)
 		}
 		if m != nil && m.ClusterLeader != nil {
 			m.ClusterLeader.WithLabelValues(localName).Set(0)
@@ -496,10 +514,13 @@ func (c *Cluster) canLead(numMembers int) bool {
 }
 
 // quorum is the number of visible members a leader needs: a majority of the
-// configured cluster, counting this node.
+// cluster the peers list describes, counting this node.
 func (c *Cluster) quorum() int {
-	return (len(c.peers)+1)/2 + 1
+	return c.expected/2 + 1
 }
+
+// missingPeerWarnInterval is how often a node that keeps missing members says so.
+const missingPeerWarnInterval = 10 * time.Minute
 
 // rejoinLoop retries joining the configured peers for as long as any of them
 // is missing. memberlist drops a dead node after 30s and never reconnects it on
@@ -507,81 +528,109 @@ func (c *Cluster) quorum() int {
 // retrying only while alone was not enough: a partition that left no side alone
 // (two and two) never healed, and with a majority required to lead, the whole
 // cluster stayed leaderless until a restart.
+//
+// A successful join is not logged here: memberlist calls a join successful as
+// soon as one live peer answers, so with a node down every retry "succeeds".
+// NotifyJoin logs each member that actually comes back. What is logged is a
+// member missing for longer than the startup grace - a peer with the wrong
+// port or gossip key is otherwise silent - repeated every
+// missingPeerWarnInterval while it lasts.
 func (c *Cluster) rejoinLoop() {
 	ticker := time.NewTicker(c.rejoinInterval)
 	defer ticker.Stop()
 
+	var missingSince, lastWarn time.Time
 	for {
 		select {
 		case <-c.done:
 			return
 		case <-ticker.C:
-			if c.ml.NumMembers() >= len(c.peers)+1 {
+			members := c.ml.NumMembers()
+			if members >= c.expected {
+				if !lastWarn.IsZero() {
+					c.logger.Info("cluster membership complete again", "members", members)
+				}
+				missingSince, lastWarn = time.Time{}, time.Time{}
 				continue
 			}
-			if n, err := c.ml.Join(c.peers); err != nil {
+
+			if missingSince.IsZero() {
+				missingSince = time.Now()
+			}
+			if time.Since(missingSince) >= c.leaderGracePeriod && time.Since(lastWarn) >= missingPeerWarnInterval {
+				c.logger.Warn("cluster members missing - retrying the join",
+					"members", members, "expected", c.expected,
+					"missing_for", time.Since(missingSince).Round(time.Second), "peers", c.peers)
+				lastWarn = time.Now()
+			}
+
+			if _, err := c.ml.Join(c.peers); err != nil {
 				c.logger.Debug("cluster rejoin failed", "peers", c.peers, "error", err)
-			} else {
-				c.logger.Info("rejoined cluster", "contacted_peers", n)
-				c.updateLeader()
 			}
 		}
 	}
 }
 
-// withoutSelf drops the entries of a peer list that name this node: any entry
-// whose port is this node's and whose host resolves to one of its addresses.
-// Duplicates go too. Resolution failures keep the entry - a peer that cannot
-// be resolved is still a peer.
-func withoutSelf(peers []string, local *memberlist.Node, defaultPort int) (kept, dropped []string) {
-	localIPs := map[string]bool{local.Addr.String(): true}
-	if addrs, err := net.InterfaceAddrs(); err == nil {
-		for _, addr := range addrs {
-			if ipNet, ok := addr.(*net.IPNet); ok {
-				localIPs[ipNet.IP.String()] = true
-			}
-		}
-	}
+// peerLookupTimeout bounds each name lookup clusterSize makes at start.
+const peerLookupTimeout = 2 * time.Second
 
-	seen := make(map[string]bool, len(peers))
+func lookupPeer(host string) ([]net.IP, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), peerLookupTimeout)
+	defer cancel()
+	return net.DefaultResolver.LookupIP(ctx, "ip", host)
+}
+
+// clusterSize works out how many nodes a peers list describes, this node
+// included: one per distinct entry, plus one. Entries are compared after
+// normalising - lower case, the port made explicit, an IP in canonical form -
+// so "192.0.2.2" and "192.0.2.2:7946" are one peer. Names are resolved for one
+// purpose only: an entry whose every address is this node's, at this node's
+// port, is this node and is not counted. One that does not resolve is counted:
+// a peer that cannot be resolved is still a peer.
+//
+// Counting anything cleverer than entries went wrong every way it was tried.
+// Counting resolved addresses made a dual-stack peer (A and AAAA) two nodes;
+// flooring at the most members ever seen kept a decommissioned node in the
+// count until every survivor was restarted. So the rule is plain, and it holds
+// for the one way the list should be written - every other node once, by
+// address, which is what the ansible template does. One DNS name for the whole
+// cluster counts as one peer and undercounts the majority; do not use one.
+//
+// self lists the entries that name this node.
+func clusterSize(peers []string, localIPs map[string]bool, localPort int, lookup func(string) ([]net.IP, error)) (size int, self []string) {
+	distinct := make(map[string]bool)
 	for _, peer := range peers {
-		if seen[peer] {
-			continue
-		}
-		seen[peer] = true
-
-		host, port := peer, defaultPort
+		host, port := peer, localPort // memberlist's default is its own bind port
 		if h, p, err := net.SplitHostPort(peer); err == nil {
 			host = h
 			if n, err := strconv.Atoi(p); err == nil {
 				port = n
 			}
 		}
-		if port != int(local.Port) {
-			kept = append(kept, peer)
-			continue
-		}
+		host = strings.ToLower(host)
 
 		var ips []net.IP
 		if ip := net.ParseIP(host); ip != nil {
+			host = ip.String()
 			ips = []net.IP{ip}
-		} else if resolved, err := net.LookupIP(host); err == nil {
+		} else if resolved, err := lookup(host); err == nil {
 			ips = resolved
 		}
-		self := false
+
+		isSelf := port == localPort && len(ips) > 0
 		for _, ip := range ips {
-			if localIPs[ip.String()] {
-				self = true
+			if !localIPs[ip.String()] {
+				isSelf = false
 				break
 			}
 		}
-		if self {
-			dropped = append(dropped, peer)
-		} else {
-			kept = append(kept, peer)
+		if isSelf {
+			self = append(self, peer)
+			continue
 		}
+		distinct[net.JoinHostPort(host, strconv.Itoa(port))] = true
 	}
-	return kept, dropped
+	return len(distinct) + 1, self
 }
 
 // SetMetrics attaches the metrics instance so the cluster can publish the

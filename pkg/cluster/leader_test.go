@@ -1,13 +1,14 @@
 package cluster
 
 import (
+	"context"
 	"fmt"
 	"io"
-
+	"log/slog"
+	"net"
+	"sync/atomic"
 	"testing"
 	"time"
-
-	"log/slog"
 )
 
 func TestLeaderElection_SingleNode(t *testing.T) {
@@ -475,3 +476,131 @@ func TestQuorumIgnoresThisNodeInThePeerList(t *testing.T) {
 		t.Errorf("quorum = %d for a cluster of three, want 2 (peers kept: %v)", got, c.peers)
 	}
 }
+
+// The majority is counted one node per distinct peers entry. Addresses are
+// TEST-NET (192.0.2.0/24) and the local set is injected, so the machine running
+// the test cannot change the answer.
+func TestClusterSizeCountsOneNodePerDistinctEntry(t *testing.T) {
+	local := map[string]bool{"192.0.2.1": true, "2001:db8::1": true}
+	lookup := func(host string) ([]net.IP, error) {
+		switch host {
+		case "me.test": // dual-stack, both addresses this node's
+			return []net.IP{net.ParseIP("192.0.2.1"), net.ParseIP("2001:db8::1")}, nil
+		case "b.test": // dual-stack peer
+			return []net.IP{net.ParseIP("192.0.2.2"), net.ParseIP("2001:db8::2")}, nil
+		case "cluster.test": // a shared name, this node among others
+			return []net.IP{net.ParseIP("192.0.2.1"), net.ParseIP("192.0.2.2")}, nil
+		}
+		return nil, fmt.Errorf("no such host %q", host)
+	}
+
+	cases := []struct {
+		name  string
+		peers []string
+		size  int
+		self  int
+	}{
+		{"one entry per peer", []string{"192.0.2.2:7946", "192.0.2.3:7946"}, 3, 0},
+		{"this node listed", []string{"192.0.2.1:7946", "me.test:7946", "192.0.2.2:7946", "192.0.2.3:7946"}, 3, 2},
+		{"a peer with and without the port", []string{"192.0.2.2", "192.0.2.2:7946", "192.0.2.3:7946"}, 3, 0},
+		{"a dual-stack peer is one node", []string{"b.test:7946", "192.0.2.3:7946"}, 3, 0},
+		{"a shared name is one entry, not this node", []string{"cluster.test:7946"}, 2, 0},
+		{"unresolvable counts once", []string{"gone.test:7946", "GONE.test:7946", "192.0.2.2:7946"}, 3, 0},
+		{"same address, other port", []string{"192.0.2.1:7947"}, 2, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			size, self := clusterSize(tc.peers, local, 7946, lookup)
+			if size != tc.size || len(self) != tc.self {
+				t.Errorf("clusterSize = %d (self %v), want %d with %d self entries", size, self, tc.size, tc.self)
+			}
+		})
+	}
+}
+
+// Duplicates were removed only when a self entry was dropped too, so [b, c, c]
+// counted a cluster of four: a majority of three, and a rejoin that never
+// stopped retrying.
+func TestPeerListDuplicatesDoNotInflateQuorum(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c, err := NewCluster(Config{
+		NodeName: "node-a", BindAddr: "127.0.0.1", BindPort: 17993,
+		Peers:  []string{"127.0.0.1:17994", "127.0.0.1:17995", "127.0.0.1:17995"},
+		Logger: logger, LeaderGracePeriod: time.Hour, RejoinInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create cluster: %v", err)
+	}
+	defer c.Shutdown()
+
+	if got := c.quorum(); got != 2 {
+		t.Errorf("quorum = %d for a cluster of three, want 2 (peers kept: %v)", got, c.peers)
+	}
+}
+
+// countingHandler counts log records carrying a given message.
+type countingHandler struct {
+	msg string
+	n   atomic.Int32
+}
+
+func (h *countingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *countingHandler) Handle(_ context.Context, r slog.Record) error {
+	if r.Message == h.msg {
+		h.n.Add(1)
+	}
+	return nil
+}
+func (h *countingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *countingHandler) WithGroup(string) slog.Handler      { return h }
+
+// With a peer down for maintenance the rejoin runs every interval, and
+// memberlist calls it a success as soon as one live peer answers. Logging each
+// one buried the real rejoins; logging nothing hid a peer that never comes back.
+// A missing member is reported once past the startup grace, then rate-limited.
+func TestRejoinReportsAMissingMemberOnce(t *testing.T) {
+	rejoined := &countingHandler{msg: "rejoined cluster"}
+	missing := &countingHandler{msg: "cluster members missing - retrying the join"}
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	b, err := NewCluster(Config{
+		NodeName: "node-b", BindAddr: "127.0.0.1", BindPort: 17997,
+		Peers: []string{}, Logger: quiet,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create node-b: %v", err)
+	}
+	defer b.Shutdown()
+
+	a, err := NewCluster(Config{
+		NodeName: "node-a", BindAddr: "127.0.0.1", BindPort: 17996,
+		Peers:  []string{"127.0.0.1:17997", "127.0.0.1:17998"}, // node-c is down
+		Logger: slog.New(multiHandler{rejoined, missing}), LeaderGracePeriod: 300 * time.Millisecond,
+		RejoinInterval: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create node-a: %v", err)
+	}
+	defer a.Shutdown()
+
+	time.Sleep(1500 * time.Millisecond)
+	if n := rejoined.n.Load(); n > 0 {
+		t.Errorf("logged %d rejoins while membership never changed", n)
+	}
+	if n := missing.n.Load(); n != 1 {
+		t.Errorf("reported the missing member %d times, want once", n)
+	}
+}
+
+// multiHandler fans a record out to several handlers.
+type multiHandler []slog.Handler
+
+func (m multiHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (m multiHandler) Handle(ctx context.Context, r slog.Record) error {
+	for _, h := range m {
+		h.Handle(ctx, r)
+	}
+	return nil
+}
+func (m multiHandler) WithAttrs([]slog.Attr) slog.Handler { return m }
+func (m multiHandler) WithGroup(string) slog.Handler      { return m }

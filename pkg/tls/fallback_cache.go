@@ -51,6 +51,8 @@ type FallbackCache struct {
 	lastS3Check      time.Time
 	checkInterval    time.Duration
 	consecutiveFails int
+	// localWriteTimeout bounds a local write, which runs under mu.
+	localWriteTimeout time.Duration
 }
 
 // NewFallbackCache creates a new two-tier cache with S3 as primary.
@@ -70,14 +72,15 @@ func NewFallbackCache(localDir string, s3Cache *S3Cache, logger *slog.Logger) *F
 	}
 
 	f := &FallbackCache{
-		primary:       s3Cache,
-		fallback:      autocert.DirCache(localDir),
-		logger:        logger,
-		pending:       make(map[string]struct{}),
-		localSeq:      make(map[string]uint64),
-		pendingDir:    pendingDir,
-		s3Available:   true,
-		checkInterval: 30 * time.Second,
+		primary:           s3Cache,
+		fallback:          autocert.DirCache(localDir),
+		logger:            logger,
+		pending:           make(map[string]struct{}),
+		localSeq:          make(map[string]uint64),
+		localWriteTimeout: 10 * time.Second,
+		pendingDir:        pendingDir,
+		s3Available:       true,
+		checkInterval:     30 * time.Second,
 	}
 	f.loadPending()
 	return f
@@ -357,8 +360,18 @@ func (f *FallbackCache) writeThrough(ctx context.Context, key string, data, loca
 
 // writeLocalLocked writes the local copy and counts the write. Callers hold mu;
 // this touches nothing but the local filesystem.
+//
+// The caller cannot cancel it. autocert's DirCache.Put returns ctx.Err() while
+// its own goroutine may still rename the new file into place, so a cancelled
+// write says nothing about what is on disk, and the write count and pending
+// marker stop describing it. Nor should the caller giving up lose the
+// certificate: it has been issued, and on the outage path this is its only
+// copy. It is still bounded (localWriteTimeout): mu is held, and a hung
+// filesystem must not hold every Get - and so every handshake - with it.
 func (f *FallbackCache) writeLocalLocked(ctx context.Context, key string, data []byte) error {
-	if err := f.fallback.Put(ctx, key, data); err != nil {
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), f.localWriteTimeout)
+	defer cancel()
+	if err := f.fallback.Put(writeCtx, key, data); err != nil {
 		f.logger.Warn("FallbackCache: failed to write the local certificate copy", "name", key, "error", err)
 		return err
 	}
@@ -372,14 +385,18 @@ func (f *FallbackCache) writeLocalLocked(ctx context.Context, key string, data [
 // it saw nothing pending, found the local bytes different, and put the old
 // entry over the only copy of a freshly issued key pair.
 //
-// Only a copy that was written is pending; clearing the marker is right either
-// way, or a stale one would make Get serve an old local copy over S3's.
+// A failed write leaves a pending marker alone: the file on disk is still an
+// earlier copy S3 never received - during an outage, the only copy of that key
+// pair. Clearing is still right when S3 took the data (pending false): a stale
+// marker would make Get serve that old local copy over S3's newer one.
 func (f *FallbackCache) storeLocal(ctx context.Context, key string, data []byte, pending bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	err := f.writeLocalLocked(ctx, key, data)
-	f.setPendingLocked(key, pending && err == nil)
+	if err == nil || !pending {
+		f.setPendingLocked(key, pending)
+	}
 	return err
 }
 

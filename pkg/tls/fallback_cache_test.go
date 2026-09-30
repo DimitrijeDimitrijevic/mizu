@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -684,5 +685,100 @@ func TestFallbackCachePutDuringOutageIsNotOverwrittenByAConcurrentRead(t *testin
 	}
 	if !cache.isPending(key) {
 		t.Error("the new entry is not marked pending for S3")
+	}
+}
+
+// failingPutCache refuses writes while fail is set.
+type failingPutCache struct {
+	autocert.Cache
+	fail atomic.Bool
+}
+
+func (c *failingPutCache) Put(ctx context.Context, key string, data []byte) error {
+	if c.fail.Load() {
+		return errors.New("disk full")
+	}
+	return c.Cache.Put(ctx, key, data)
+}
+
+// During an outage the local copy is the only copy of a newly issued key pair,
+// and its marker is what gets it to S3. A later local write that failed cleared
+// that marker, although the earlier copy was still on disk: it was never
+// uploaded, and the first read once S3 was back put S3's older entry over it.
+func TestFallbackCacheFailedLocalWriteKeepsTheEarlierPendingCopy(t *testing.T) {
+	cache, s3fake, dir := newTestFallbackCache(t)
+	ctx := context.Background()
+	const key = "mx.example.com"
+	s3fake.setDown(true)
+
+	disk := &failingPutCache{Cache: cache.fallback}
+	cache.fallback = disk
+
+	if err := cache.Put(ctx, key, []byte("issued-during-outage")); err != nil {
+		t.Fatalf("first Put: %v", err)
+	}
+	disk.fail.Store(true)
+	if err := cache.Put(ctx, key, []byte("later")); err == nil {
+		t.Fatal("second Put succeeded although neither store took it")
+	}
+
+	if got, _ := readLocal(t, dir, key); got != "issued-during-outage" {
+		t.Fatalf("setup: local copy = %q", got)
+	}
+	if !cache.isPending(key) {
+		t.Error("the only copy of the key pair issued during the outage is no longer queued for S3")
+	}
+}
+
+// autocert's DirCache.Put returns ctx.Err() while its own goroutine can still
+// rename the new file into place, so a cancelled local write says nothing about
+// what is on disk - and the pending marker and write count stop describing it.
+// The local write must not be cancellable: a certificate issued during an
+// outage is kept even when the caller that ordered it gave up.
+func TestFallbackCacheLocalWriteIgnoresCallerCancellation(t *testing.T) {
+	cache, s3fake, dir := newTestFallbackCache(t)
+	const key = "mx.example.com"
+	s3fake.setDown(true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := cache.Put(ctx, key, []byte("issued")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if got, _ := readLocal(t, dir, key); got != "issued" {
+		t.Errorf("local copy = %q, want the issued certificate", got)
+	}
+	if !cache.isPending(key) {
+		t.Error("the certificate is not queued for S3")
+	}
+}
+
+// hangingPutCache never finishes a write until its context ends.
+type hangingPutCache struct{ autocert.Cache }
+
+func (hangingPutCache) Put(ctx context.Context, _ string, _ []byte) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// The local write ignores the caller's cancellation, and it runs under mu,
+// which every Get takes. A hung filesystem must still let go.
+func TestFallbackCacheHungLocalWriteDoesNotHoldTheLock(t *testing.T) {
+	cache, s3fake, _ := newTestFallbackCache(t)
+	s3fake.setDown(true)
+	cache.fallback = hangingPutCache{cache.fallback}
+	cache.localWriteTimeout = 100 * time.Millisecond
+
+	done := make(chan error, 1)
+	go func() { done <- cache.Put(context.Background(), "mx.example.com", []byte("x")) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("Put reported success although nothing was stored")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a hung local write held the cache indefinitely")
 	}
 }

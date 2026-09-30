@@ -101,11 +101,23 @@ Key packages:
      drops a dead node after 30s and never reconnects it on its own, so a
      partition that left no side alone (two and two) never healed, and with a
      majority required to lead, the whole cluster stayed leaderless.
-   - **A peers list that names this node is trimmed** (`withoutSelf`, by port
-     plus resolved address). memberlist tolerates joining yourself, and the
-     manual `cluster.peers` override passes the list through verbatim; counting
-     the entry made the majority one member too many, so one node down for a
-     reboot left the survivors unable to lead.
+   - **The majority is counted one node per distinct `peers` entry**
+     (`clusterSize`): entries normalised (lower case, explicit port, canonical
+     IP) and deduplicated, less entries whose every address is this node's
+     (memberlist tolerates joining yourself; the manual `cluster.peers` override
+     is passed through verbatim). DNS is used only for that self check. Cleverer
+     rules each broke a real configuration: counting resolved addresses made a
+     dual-stack peer two nodes; flooring at the most members ever seen kept a
+     decommissioned node in the count until every survivor restarted. **Write
+     `peers` as every other node once, by address** — the ansible template does.
+     One DNS name for the whole cluster counts as one peer and undercounts the
+     majority, so a partition could give both sides a leader: unsupported.
+     Join still gets the list as written.
+   - `rejoinLoop` does not log a successful join — memberlist calls one
+     successful as soon as any live peer answers, so with a node down every
+     retry "succeeds"; `NotifyJoin` logs members that really come back. It warns
+     once a member has been missing past `LeaderGracePeriod`, then every 10 min,
+     so a peer with the wrong port or gossip key is not silent.
    - Shares connection state and rate limits across cluster nodes
    - Message types: `MessageTypeConnectionState`, `MessageTypeRateLimit`
 
@@ -195,7 +207,10 @@ Key packages:
      The local write and the marker are one step under the lock (`storeLocal`):
      done separately, a read that S3 had answered with the older entry could
      land between them, see nothing pending, and put the old entry over the only
-     copy of a freshly issued key pair.
+     copy of a freshly issued key pair. A failed local write leaves an existing
+     marker alone (the earlier copy is still on disk), and the local write
+     ignores the caller's cancellation: autocert's `DirCache.Put` returns
+     `ctx.Err()` while its goroutine may still rename the file into place.
      **No lock is ever held across an S3 call.** autocert holds one global mutex
      across `Cache.Get`, so anything a read waits for, every handshake waits for;
      the pending sync round-trips outside the lock and uses `localSeq` to tell
