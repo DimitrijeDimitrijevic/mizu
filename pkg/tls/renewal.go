@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/acme"
@@ -71,9 +72,20 @@ type autocertInstance struct {
 	mgr         *autocert.Manager
 	httpHandler http.Handler
 	transport   *acmeTransport
+	hiding      *hidingCache // set on an orderer, see newOrderer
 }
 
-func (i *autocertInstance) retire() { i.transport.retired.Store(true) }
+// retire cuts the instance off from the CA. An orderer also stops hiding: its
+// renewal timer would otherwise find nothing to load when it fires, try to
+// order, be refused, and retry every half hour for the rest of the process.
+// With the cache visible it loads the renewed certificate and settles on that
+// certificate's own renewal time, like any other retired instance.
+func (i *autocertInstance) retire() {
+	i.transport.retired.Store(true)
+	if i.hiding != nil {
+		i.hiding.active.Store(false)
+	}
+}
 
 // newAutocert builds an autocert instance over the given cache.
 func (m *Manager) newAutocert(cache autocert.Cache) *autocertInstance {
@@ -138,27 +150,40 @@ func (m *Manager) reload(reason string) error {
 	old.retire()
 
 	// What the new instance will load is known already, so the record and the
-	// exported expiry follow the swap instead of waiting for the next pass.
+	// exported expiry follow the swap instead of waiting for the next pass. Not
+	// held yet: the new instance loads at its first handshake.
 	for _, rec := range verified {
-		m.recordServed(rec.domain, rec.keyType, rec.leaf)
+		m.recordServed(rec.domain, rec.keyType, rec.leaf, false)
 	}
 
 	m.logger.Info("TLS: certificates reloaded from the cache", "reason", reason)
 	return nil
 }
 
-// hidingCache reports the hidden keys as missing, so that an autocert instance
-// reading through it orders those certificates instead of loading them.
+// hidingCache reports the hidden keys as missing while active, so that an
+// autocert instance reading through it orders those certificates instead of
+// loading them.
 type hidingCache struct {
 	autocert.Cache
 	hidden map[string]struct{}
+	active atomic.Bool
 }
 
 func (c *hidingCache) Get(ctx context.Context, key string) ([]byte, error) {
-	if _, ok := c.hidden[key]; ok {
+	if _, ok := c.hidden[key]; ok && c.active.Load() {
 		return nil, autocert.ErrCacheMiss
 	}
 	return c.Cache.Get(ctx, key)
+}
+
+// newOrderer builds a throwaway instance that orders the hidden keys instead of
+// loading them. Retiring it makes the cache visible again.
+func (m *Manager) newOrderer(hidden map[string]struct{}) *autocertInstance {
+	hiding := &hidingCache{Cache: m.cache, hidden: hidden}
+	hiding.active.Store(true)
+	inst := m.newAutocert(hiding)
+	inst.hiding = hiding
+	return inst
 }
 
 // RenewCertificate orders a new certificate for a domain and puts it into
@@ -212,7 +237,7 @@ func (m *Manager) RenewCertificate(ctx context.Context, domain string, keyTypes 
 	for _, keyType := range keyTypes {
 		hidden[certCacheKey(domain, keyType)] = struct{}{}
 	}
-	orderer := m.newAutocert(&hidingCache{Cache: m.cache, hidden: hidden})
+	orderer := m.newOrderer(hidden)
 	defer orderer.retire()
 
 	var renewed []string
@@ -248,7 +273,7 @@ func (m *Manager) RenewCertificate(ctx context.Context, domain string, keyTypes 
 		// ever served it - a newly configured one, or any renewal in the first
 		// couple of minutes after boot - would otherwise stay unrecorded, absent
 		// from the metric and invisible to adoptNewerFromCache.
-		m.recordServed(domain, keyType, cert.Leaf)
+		m.recordServed(domain, keyType, cert.Leaf, false)
 
 		renewed = append(renewed, fmt.Sprintf("%s (%s, expires %s)",
 			domain, keyType, cert.Leaf.NotAfter.UTC().Format(time.RFC3339)))
@@ -262,7 +287,15 @@ func (m *Manager) RenewCertificate(ctx context.Context, domain string, keyTypes 
 	// errors still say what was left undone.
 
 	if err := m.reload("certificate renewed on request: " + domain); err != nil {
-		errs = append(errs, fmt.Errorf("%w: %v", ErrNotInService, err))
+		// ErrNotInService is a verdict on the whole request - "everything was
+		// issued and stored, do not re-run this" - so it is only given when
+		// nothing else went wrong. With a key type still unissued the operator
+		// has to re-run, and must not be told otherwise.
+		if len(errs) == 0 {
+			errs = append(errs, fmt.Errorf("%w: %v", ErrNotInService, err))
+		} else {
+			errs = append(errs, fmt.Errorf("not put into service: %v", err))
+		}
 	}
 	return renewed, errors.Join(errs...)
 }
@@ -395,8 +428,10 @@ func parseCacheEntry(data []byte) (*x509.Certificate, error) {
 // until its renewal time, up to two months away.
 func (m *Manager) adoptNewerFromCache() {
 	for _, rec := range m.servedRecords() {
+		// Only a certificate autocert holds in memory needs replacing; one it
+		// has not loaded yet comes from the cache at the next handshake anyway.
 		// Inside the renewal window autocert is already polling the cache.
-		if time.Until(rec.leaf.NotAfter) <= m.renewBefore {
+		if !rec.held || time.Until(rec.leaf.NotAfter) <= m.renewBefore {
 			continue
 		}
 

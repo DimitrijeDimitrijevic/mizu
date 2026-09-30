@@ -22,6 +22,7 @@ type fakeS3 struct {
 	mu       sync.Mutex
 	objects  map[string][]byte
 	down     bool
+	putDown  bool          // writes fail while reads still answer
 	delay    time.Duration // how long a read takes before answering
 	putDelay time.Duration // how long a write takes before completing
 }
@@ -83,7 +84,7 @@ func (f *fakeS3) PutObject(ctx context.Context, in *s3.PutObjectInput, _ ...func
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.down {
+	if f.down || f.putDown {
 		return nil, errors.New("s3 unreachable")
 	}
 	data, err := io.ReadAll(in.Body)
@@ -627,5 +628,61 @@ func TestFallbackCacheWriteThroughSkipsIdenticalBytes(t *testing.T) {
 
 	if afterRest != afterFirst {
 		t.Errorf("the local copy was rewritten %d more times for identical bytes", afterRest-afterFirst)
+	}
+}
+
+// hookedCache wraps a cache and runs a hook right after each Put has landed.
+type hookedCache struct {
+	autocert.Cache
+	afterPut func(key string)
+}
+
+func (c *hookedCache) Put(ctx context.Context, key string, data []byte) error {
+	err := c.Cache.Put(ctx, key, data)
+	if c.afterPut != nil {
+		c.afterPut(key)
+	}
+	return err
+}
+
+// Put's outage path wrote the local copy and only then, under the lock, marked
+// it pending. A concurrent Get that S3 had answered with the older entry could
+// slip in between: it saw nothing pending, found the local bytes different, and
+// wrote the old entry over the only copy of a freshly issued key pair — which
+// was then marked pending and uploaded over S3's copy as well.
+func TestFallbackCachePutDuringOutageIsNotOverwrittenByAConcurrentRead(t *testing.T) {
+	cache, s3fake, dir := newTestFallbackCache(t)
+	ctx := context.Background()
+	const key = "mx.example.com"
+	s3fake.objects["certs/"+key] = []byte("old")
+	s3fake.putDown = true // reads still work, writes do not
+
+	done := make(chan struct{})
+	var once sync.Once // the read's own local write comes through this hook too
+	cache.fallback = &hookedCache{Cache: cache.fallback, afterPut: func(k string) {
+		if k != key {
+			return
+		}
+		once.Do(func() {
+			// A read of S3's older entry lands in the window. It waits for the
+			// lock, so give it a moment: unfixed, it goes straight through.
+			go func() { cache.writeThrough(ctx, key, []byte("old"), nil, autocert.ErrCacheMiss); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(200 * time.Millisecond):
+			}
+		})
+	}}
+
+	if err := cache.Put(ctx, key, []byte("new")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	<-done
+
+	if got, _ := readLocal(t, dir, key); got != "new" {
+		t.Errorf("local copy = %q after the read, want the newly issued entry", got)
+	}
+	if !cache.isPending(key) {
+		t.Error("the new entry is not marked pending for S3")
 	}
 }

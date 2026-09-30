@@ -262,7 +262,7 @@ func NewManager(ctx context.Context, cfg *Config, logger *slog.Logger, isLeaderF
 				"chain_length", len(cert.Certificate))
 		}
 		if !isALPNChallenge && cert.Leaf != nil {
-			m.recordServed(serverName, keyTypeOf(cert.Leaf), cert.Leaf)
+			m.recordServed(serverName, keyTypeOf(cert.Leaf), cert.Leaf, true)
 		}
 
 		logger.Debug("TLS: certificate provided successfully", "domain", serverName)
@@ -354,7 +354,7 @@ func (m *Manager) maintainCertificates() bool {
 
 	for _, domain := range m.domains {
 		for _, keyType := range certKeyTypes {
-			leaf, err := m.currentLeaf(inst, isLeader, domain, keyType)
+			leaf, held, err := m.currentLeaf(inst, isLeader, domain, keyType)
 			if err != nil {
 				// Report "nothing to serve" rather than leaving the last good
 				// value in place, where it would read as a healthy certificate.
@@ -370,7 +370,7 @@ func (m *Manager) maintainCertificates() bool {
 				continue
 			}
 
-			m.recordServed(domain, keyType, leaf)
+			m.recordServed(domain, keyType, leaf, held)
 			m.logCertificateStatus(domain, keyType, leaf)
 		}
 	}
@@ -381,10 +381,20 @@ func (m *Manager) maintainCertificates() bool {
 
 // certRecord is the certificate this node is currently handing out for one
 // domain and key type.
+//
+// held says whether the current autocert instance is known to hold it in
+// memory - recorded by the handshake path, or by the leader's walk, which goes
+// through autocert. A record that is not held came from the cache: it is what
+// autocert would load at the next handshake, and it keeps following the cache.
+// The distinction matters on a non-leader, where autocert reads the cache only
+// when a certificate's renewal window opens: a held certificate that the leader
+// replaced early stays in memory until adoptNewerFromCache reloads, and only a
+// held one needs that reload at all.
 type certRecord struct {
 	domain  string
 	keyType string
 	leaf    *x509.Certificate
+	held    bool
 }
 
 // recordServed notes a certificate this node has just handed out or loaded, and
@@ -396,17 +406,17 @@ type certRecord struct {
 // Repeating the last observation is free, which keeps this cheap enough for the
 // handshake path — where it also keeps the exported expiry live between the
 // hourly maintenance passes.
-func (m *Manager) recordServed(domain, keyType string, leaf *x509.Certificate) {
+func (m *Manager) recordServed(domain, keyType string, leaf *x509.Certificate, held bool) {
 	// One spelling throughout: the handshake path sees the SNI, which is
 	// punycode, while the configured domain may be Unicode. Recording both would
 	// give one certificate two records and two metric series.
 	domain = asciiDomain(domain)
 	key := certCacheKey(domain, keyType)
-	if prev, ok := m.served.Load(key); ok && prev.(certRecord).leaf == leaf {
+	if prev, ok := m.served.Load(key); ok && prev.(certRecord).leaf == leaf && prev.(certRecord).held == held {
 		return
 	}
 
-	m.served.Store(key, certRecord{domain: domain, keyType: keyType, leaf: leaf})
+	m.served.Store(key, certRecord{domain: domain, keyType: keyType, leaf: leaf, held: held})
 	m.observeCertificate(domain, keyType, leaf)
 }
 
@@ -467,13 +477,34 @@ func (m *Manager) observeCertificate(domain, keyType string, leaf *x509.Certific
 // and the refusal is not free: autocert keeps the failed attempt for a minute
 // and answers every handshake for that name from it without reading the cache,
 // so a certificate the leader publishes in the meantime is ignored and the next
-// pass poisons it again. It also costs an RSA keygen per domain per pass. A
-// non-leader has nothing to order, so it reads the cache instead.
-func (m *Manager) currentLeaf(inst *autocertInstance, isLeader bool, domain, keyType string) (*x509.Certificate, error) {
+// pass poisons it again. It also costs an RSA keygen per domain per pass.
+//
+// What a non-leader hands out is what its autocert holds in memory, and only the
+// handshake path sees that. Outside the renewal window such a record stands:
+// autocert will not look at the cache until the window opens, so the cache says
+// nothing about what is served — and adoptNewerFromCache needs the served
+// certificate to compare against. Recording the cache's leaf over it made the
+// comparison one of the cache with itself, and a certificate the leader replaced
+// early never reached the other nodes. Inside the window autocert polls the
+// cache itself and loads a newer entry within the hour, so there the cache is
+// the better guide: a record kept past that point would go stale for good on a
+// name that sees no further handshakes. A record that did not come from a
+// handshake, or no record at all, leaves the cache as all there is to go on.
+//
+// The second result says whether the current instance is known to hold what
+// is returned (see certRecord).
+func (m *Manager) currentLeaf(inst *autocertInstance, isLeader bool, domain, keyType string) (*x509.Certificate, bool, error) {
 	if isLeader {
-		return servedLeaf(inst, domain, keyType)
+		leaf, err := servedLeaf(inst, domain, keyType)
+		return leaf, err == nil, err
 	}
-	return m.cachedLeaf(context.Background(), domain, keyType)
+	if rec, ok := m.served.Load(certCacheKey(asciiDomain(domain), keyType)); ok {
+		if rec := rec.(certRecord); rec.held && time.Until(rec.leaf.NotAfter) > m.renewBefore {
+			return rec.leaf, true, nil
+		}
+	}
+	leaf, err := m.cachedLeaf(context.Background(), domain, keyType)
+	return leaf, false, err
 }
 
 // servedLeaf returns the leaf of the certificate inst would hand out for a

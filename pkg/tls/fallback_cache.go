@@ -237,12 +237,12 @@ func (f *FallbackCache) Get(ctx context.Context, key string) ([]byte, error) {
 	switch {
 	case err == nil:
 		f.markS3Available()
-		f.writeThrough(ctx, key, data)
+		f.writeThrough(ctx, key, data, local, localErr)
 		return data, nil
 
 	case err == autocert.ErrCacheMiss:
 		f.markS3Available()
-		return f.localSeedingS3(ctx, key)
+		return f.localSeedingS3(key, local, localErr)
 
 	case localErr == nil && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil:
 		f.logger.Warn("FallbackCache: S3 too slow - serving the local copy",
@@ -298,13 +298,14 @@ func (f *FallbackCache) localAfterS3Failure(ctx context.Context, key string, cau
 //
 // Challenge responses are exempt. One that S3 does not have is spent, and
 // answering from a leftover hands the CA the token of an earlier order.
-func (f *FallbackCache) localSeedingS3(ctx context.Context, key string) ([]byte, error) {
+//
+// local is the copy Get already read, so it is not read again.
+func (f *FallbackCache) localSeedingS3(key string, data []byte, err error) ([]byte, error) {
 	if isChallengeKey(key) {
 		f.logger.Debug("FallbackCache: challenge response not in S3 (cache miss)", "name", key)
 		return nil, autocert.ErrCacheMiss
 	}
 
-	data, err := f.fallback.Get(ctx, key)
 	if err != nil {
 		f.logger.Debug("FallbackCache: certificate not found in S3 or locally (cache miss)", "name", key)
 		return nil, autocert.ErrCacheMiss
@@ -327,7 +328,12 @@ func (f *FallbackCache) localSeedingS3(ctx context.Context, key string) ([]byte,
 
 // writeThrough keeps the local copy in step with what S3 served, so the node can
 // still answer handshakes if S3 becomes unreachable.
-func (f *FallbackCache) writeThrough(ctx context.Context, key string, data []byte) {
+//
+// local is the copy Get read before asking S3. Comparing against that rather
+// than a fresh read is deliberate as well as cheaper: a Put that stored a newer
+// certificate in the meantime has changed the file, and a fresh read would find
+// it different from S3's older answer and overwrite it.
+func (f *FallbackCache) writeThrough(ctx context.Context, key string, data, local []byte, localErr error) {
 	if isChallengeKey(key) {
 		return
 	}
@@ -342,7 +348,7 @@ func (f *FallbackCache) writeThrough(ctx context.Context, key string, data []byt
 
 	// Nothing to do when the bytes already match: a maintenance pass reads every
 	// certificate, and rewriting each file every hour is churn for no change.
-	if current, err := f.fallback.Get(ctx, key); err == nil && bytes.Equal(current, data) {
+	if localErr == nil && bytes.Equal(local, data) {
 		return
 	}
 
@@ -351,21 +357,30 @@ func (f *FallbackCache) writeThrough(ctx context.Context, key string, data []byt
 
 // writeLocalLocked writes the local copy and counts the write. Callers hold mu;
 // this touches nothing but the local filesystem.
-func (f *FallbackCache) writeLocalLocked(ctx context.Context, key string, data []byte) {
+func (f *FallbackCache) writeLocalLocked(ctx context.Context, key string, data []byte) error {
 	if err := f.fallback.Put(ctx, key, data); err != nil {
 		f.logger.Warn("FallbackCache: failed to write the local certificate copy", "name", key, "error", err)
-		return
+		return err
 	}
 	f.localSeq[key]++
+	return nil
 }
 
-// storeLocal writes the local copy and records whether S3 still needs it.
-func (f *FallbackCache) storeLocal(ctx context.Context, key string, data []byte, pending bool) {
+// storeLocal writes the local copy and records whether S3 still needs it, as
+// one step under the lock. Put's outage path used to do the two separately,
+// and a read that S3 had answered with the older entry could land in between:
+// it saw nothing pending, found the local bytes different, and put the old
+// entry over the only copy of a freshly issued key pair.
+//
+// Only a copy that was written is pending; clearing the marker is right either
+// way, or a stale one would make Get serve an old local copy over S3's.
+func (f *FallbackCache) storeLocal(ctx context.Context, key string, data []byte, pending bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.writeLocalLocked(ctx, key, data)
-	f.setPendingLocked(key, pending)
+	err := f.writeLocalLocked(ctx, key, data)
+	f.setPendingLocked(key, pending && err == nil)
+	return err
 }
 
 // Put stores a certificate, trying S3 first (source of truth), then falling back to local cache.
@@ -396,18 +411,12 @@ func (f *FallbackCache) Put(ctx context.Context, key string, data []byte) error 
 	}
 
 	f.logger.Info("storing certificate in fallback cache (needs S3 sync)", "name", key)
-	if err := f.fallback.Put(ctx, key, data); err != nil {
+	if err := f.storeLocal(ctx, key, data, true); err != nil {
 		if s3Err != nil {
 			return fmt.Errorf("both S3 and fallback cache failed - S3 error: %w, fallback error: %v", s3Err, err)
 		}
 		return err
 	}
-
-	f.mu.Lock()
-	f.localSeq[key]++
-	f.setPendingLocked(key, true)
-	f.mu.Unlock()
-
 	return nil
 }
 

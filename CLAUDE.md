@@ -94,9 +94,18 @@ Key packages:
      member is seen, or until `LeaderGracePeriod` (1 min) passes with no peer
      reachable, so a genuinely lone node can still renew certificates.
    - **memberlist never retries a join.** `rejoinLoop` retries every 15s while
-     the node is alone. Without it, nodes restarted at the same moment (an
-     ansible deploy) each miss the other's listener and stay one-member
-     clusters — each one leader — until the next restart.
+     any configured peer is missing (`NumMembers() < len(peers)+1`). Without it,
+     nodes restarted at the same moment (an ansible deploy) each miss the
+     other's listener and stay one-member clusters — each one leader — until
+     the next restart. Retrying only while *alone* was not enough: memberlist
+     drops a dead node after 30s and never reconnects it on its own, so a
+     partition that left no side alone (two and two) never healed, and with a
+     majority required to lead, the whole cluster stayed leaderless.
+   - **A peers list that names this node is trimmed** (`withoutSelf`, by port
+     plus resolved address). memberlist tolerates joining yourself, and the
+     manual `cluster.peers` override passes the list through verbatim; counting
+     the entry made the majority one member too many, so one node down for a
+     reboot left the survivors unable to lead.
    - Shares connection state and rate limits across cluster nodes
    - Message types: `MessageTypeConnectionState`, `MessageTypeRateLimit`
 
@@ -183,6 +192,10 @@ Key packages:
      older copy back over it; a marker that outlived its certificate cannot
      overwrite a newer one in S3 (`supersededInS3`), and one whose certificate is
      gone falls through to S3 rather than reporting a miss.
+     The local write and the marker are one step under the lock (`storeLocal`):
+     done separately, a read that S3 had answered with the older entry could
+     land between them, see nothing pending, and put the old entry over the only
+     copy of a freshly issued key pair.
      **No lock is ever held across an S3 call.** autocert holds one global mutex
      across `Cache.Get`, so anything a read waits for, every handshake waits for;
      the pending sync round-trips outside the lock and uses `localSeq` to tell
@@ -221,6 +234,16 @@ Key packages:
      has nothing, so on the leader a question becomes an ACME order. `reload` and
      `adoptNewerFromCache` read `Manager.served` (recorded by the handshake path
      and the maintenance walk) and verify against the cache with `cachedLeaf`,
+     Each record says whether autocert is known to *hold* the certificate
+     (`certRecord.held`: recorded by a handshake, or by the leader's walk, which
+     goes through autocert). On a non-leader a held record outside its renewal
+     window stands — autocert will not look at the cache until the window opens,
+     so the cache says nothing about what is served, and recording the cache's
+     leaf over it made adoption compare the cache with itself: a certificate the
+     leader replaced early never reached the other nodes. Inside the window the
+     cache is the guide again, since autocert polls it itself. A record that is
+     not held keeps following the cache and is never a reason to reload — a
+     handshake loads from the cache directly.
      which accepts exactly what autocert's `cacheGet` accepts — key first,
      nothing trailing the chain. `tls.X509KeyPair` is laxer and would pass a
      hand-placed `cat fullchain.pem privkey.pem` entry that autocert then
@@ -236,7 +259,10 @@ Key packages:
      blocked every reload in exactly the state this branch addresses.
    - **`renew-cert` orders first, replaces after** (`RenewCertificate`). A
      throwaway instance behind a `hidingCache` orders into the shared cache while
-     the live instance keeps serving; only then `reload`. Never delete the cache
+     the live instance keeps serving; only then `reload`. Retiring the orderer
+     also stops the hiding: its renewal timer would otherwise find nothing to
+     load when it fires, be refused, and retry every half hour for the rest of
+     the process. Never delete the cache
      entry up front — a failed order (rate limit) would leave the domain with no
      certificate. The call is synchronous: `/api/renew-cert` extends its write
      deadline to 11 min and `mizu-admin` its client timeout, so the operator
@@ -252,6 +278,13 @@ Key packages:
      finishing the order was protecting. The handler extends the **read** deadline
      as well as the write one: `ReadTimeout` otherwise bounds the whole request
      once anything reads from the connection.
+     The handler reads `domain` and `key_type` from the query *and* the body,
+     query winning per field; reading the body only when the query had no domain
+     dropped a `key_type` sent alongside a domain in the URL and ordered both.
+     `ErrNotInService` ("stored, do not re-run") is a verdict on the whole
+     request, given only when every key type asked for was issued and only the
+     swap failed — with one still unissued the operator has to re-run, and
+     `status: partial` says so.
      `mizu-admin tls delete` is **not** a way to force renewal — the local copy
      re-seeds S3. Use `renew-cert`.
    - **Certs replaced early reach other nodes via `adoptNewerFromCache`**

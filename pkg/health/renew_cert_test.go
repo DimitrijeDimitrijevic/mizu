@@ -245,3 +245,22 @@ func TestRenewCertHandlerSeparatesStoredFromPartial(t *testing.T) {
 		t.Errorf("status = %v, want partial", body["status"])
 	}
 }
+
+// The body was only read when the domain was missing from the query, so the
+// mixed form an operator writes by hand — domain in the URL, key_type in the
+// body — ordered both key types and spent the slot the flag exists to protect.
+func TestRenewCertHandlerReadsKeyTypeFromBodyWhenDomainIsInQuery(t *testing.T) {
+	renewer := &fakeRenewer{renewed: []string{"mx.example.com (rsa)"}}
+	srv := renewCertServer(t, renewer, time.Minute)
+
+	resp, err := http.Post(srv.URL+"?domain=mx.example.com", "application/json",
+		strings.NewReader(`{"key_type":"rsa"}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	resp.Body.Close()
+
+	if asked := renewer.askedFor(); len(asked) != 1 || asked[0] != "rsa" {
+		t.Errorf("renewer asked for %v, want [rsa]", asked)
+	}
+}

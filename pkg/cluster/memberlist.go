@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"io"
+	"strconv"
 
 	"encoding/json"
 	"fmt"
@@ -183,9 +184,19 @@ func NewCluster(cfg Config) (*Cluster, error) {
 	cluster.ml = ml
 	cluster.leaderMtx.Unlock()
 
+	// A peers list that names this node - memberlist tolerates joining yourself
+	// - would make the majority one member too many, so one node down for a
+	// reboot left the survivors unable to lead.
+	if kept, dropped := withoutSelf(cfg.Peers, ml.LocalNode(), mlConfig.BindPort); len(dropped) > 0 {
+		cfg.Logger.Warn("cluster peers list names this node - ignoring those entries", "ignored", dropped)
+		cluster.leaderMtx.Lock()
+		cluster.peers = kept
+		cluster.leaderMtx.Unlock()
+	}
+
 	// Join peers if provided
-	if len(cfg.Peers) > 0 {
-		_, err := ml.Join(cfg.Peers)
+	if len(cluster.peers) > 0 {
+		_, err := ml.Join(cluster.peers)
 		if err != nil {
 			cfg.Logger.Warn("Failed to join some peers", "error", err)
 			// Don't fail completely - we might be the first node
@@ -490,8 +501,12 @@ func (c *Cluster) quorum() int {
 	return (len(c.peers)+1)/2 + 1
 }
 
-// rejoinLoop retries joining the configured peers for as long as this node is
-// alone. Once it knows any other member, gossip keeps the rest in sync.
+// rejoinLoop retries joining the configured peers for as long as any of them
+// is missing. memberlist drops a dead node after 30s and never reconnects it on
+// its own, so this is what heals a partition once the network is back - and
+// retrying only while alone was not enough: a partition that left no side alone
+// (two and two) never healed, and with a majority required to lead, the whole
+// cluster stayed leaderless until a restart.
 func (c *Cluster) rejoinLoop() {
 	ticker := time.NewTicker(c.rejoinInterval)
 	defer ticker.Stop()
@@ -501,7 +516,7 @@ func (c *Cluster) rejoinLoop() {
 		case <-c.done:
 			return
 		case <-ticker.C:
-			if c.ml.NumMembers() > 1 {
+			if c.ml.NumMembers() >= len(c.peers)+1 {
 				continue
 			}
 			if n, err := c.ml.Join(c.peers); err != nil {
@@ -512,6 +527,61 @@ func (c *Cluster) rejoinLoop() {
 			}
 		}
 	}
+}
+
+// withoutSelf drops the entries of a peer list that name this node: any entry
+// whose port is this node's and whose host resolves to one of its addresses.
+// Duplicates go too. Resolution failures keep the entry - a peer that cannot
+// be resolved is still a peer.
+func withoutSelf(peers []string, local *memberlist.Node, defaultPort int) (kept, dropped []string) {
+	localIPs := map[string]bool{local.Addr.String(): true}
+	if addrs, err := net.InterfaceAddrs(); err == nil {
+		for _, addr := range addrs {
+			if ipNet, ok := addr.(*net.IPNet); ok {
+				localIPs[ipNet.IP.String()] = true
+			}
+		}
+	}
+
+	seen := make(map[string]bool, len(peers))
+	for _, peer := range peers {
+		if seen[peer] {
+			continue
+		}
+		seen[peer] = true
+
+		host, port := peer, defaultPort
+		if h, p, err := net.SplitHostPort(peer); err == nil {
+			host = h
+			if n, err := strconv.Atoi(p); err == nil {
+				port = n
+			}
+		}
+		if port != int(local.Port) {
+			kept = append(kept, peer)
+			continue
+		}
+
+		var ips []net.IP
+		if ip := net.ParseIP(host); ip != nil {
+			ips = []net.IP{ip}
+		} else if resolved, err := net.LookupIP(host); err == nil {
+			ips = resolved
+		}
+		self := false
+		for _, ip := range ips {
+			if localIPs[ip.String()] {
+				self = true
+				break
+			}
+		}
+		if self {
+			dropped = append(dropped, peer)
+		} else {
+			kept = append(kept, peer)
+		}
+	}
+	return kept, dropped
 }
 
 // SetMetrics attaches the metrics instance so the cluster can publish the

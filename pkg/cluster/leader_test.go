@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"fmt"
 	"io"
 
 	"testing"
@@ -397,5 +398,80 @@ func TestLeaderElection_IsolatedNodeStandsDown(t *testing.T) {
 	}
 	if leader := c2.GetLeader(); leader != "" {
 		t.Errorf("GetLeader = %q, want no leader while the cluster cannot be seen", leader)
+	}
+}
+
+// The rejoin retried only while the node was alone. memberlist drops a dead
+// node after 30s and never reconnects it on its own, so a partition that left
+// no side alone (2|2) never healed — and with a majority required to lead, the
+// whole cluster stayed leaderless until a restart.
+func TestLeaderElection_RejoinsWhileMembersAreMissing(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ports := []int{17980, 17981, 17982}
+	peersOf := func(self int) []string {
+		var peers []string
+		for _, p := range ports {
+			if p != self {
+				peers = append(peers, fmt.Sprintf("127.0.0.1:%d", p))
+			}
+		}
+		return peers
+	}
+	names := []string{"node-a", "node-b", "node-c"}
+	nodes := make([]*Cluster, 3)
+	for i := range ports {
+		c, err := NewCluster(Config{
+			NodeName: names[i], BindAddr: "127.0.0.1", BindPort: ports[i],
+			Peers: peersOf(ports[i]), Logger: logger,
+			LeaderGracePeriod: time.Hour, RejoinInterval: 200 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("Failed to create %s: %v", names[i], err)
+		}
+		nodes[i] = c
+		defer c.Shutdown()
+	}
+	if !waitFor(5*time.Second, func() bool { return nodes[2].NumMembers() == 3 && nodes[0].IsLeader() }) {
+		t.Fatalf("setup: cluster did not form")
+	}
+
+	// node-c drops out; the other two still see each other, so neither is alone.
+	nodes[2].Shutdown()
+	if !waitFor(10*time.Second, func() bool { return nodes[0].NumMembers() == 2 && nodes[1].NumMembers() == 2 }) {
+		t.Fatalf("setup: node-c still counted")
+	}
+
+	// It comes back knowing nobody: only the others' retries can reconnect it.
+	c, err := NewCluster(Config{
+		NodeName: "node-c", BindAddr: "127.0.0.1", BindPort: ports[2],
+		Peers: []string{}, Logger: logger,
+	})
+	if err != nil {
+		t.Fatalf("Failed to recreate node-c: %v", err)
+	}
+	defer c.Shutdown()
+
+	if !waitFor(10*time.Second, func() bool { return c.GetLeader() == "node-a" }) {
+		t.Fatalf("node-c was never rejoined: members=%d leader=%q", c.NumMembers(), c.GetLeader())
+	}
+}
+
+// A peers list that includes this node — memberlist tolerates joining yourself
+// — made the majority one member too many, so one node down for a reboot left
+// the survivors unable to lead.
+func TestQuorumIgnoresThisNodeInThePeerList(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c, err := NewCluster(Config{
+		NodeName: "node-a", BindAddr: "127.0.0.1", BindPort: 17990,
+		Peers:  []string{"localhost:17990", "127.0.0.1:17990", "127.0.0.1:17991", "127.0.0.1:17992"},
+		Logger: logger, LeaderGracePeriod: time.Hour, RejoinInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create cluster: %v", err)
+	}
+	defer c.Shutdown()
+
+	if got := c.quorum(); got != 2 {
+		t.Errorf("quorum = %d for a cluster of three, want 2 (peers kept: %v)", got, c.peers)
 	}
 }

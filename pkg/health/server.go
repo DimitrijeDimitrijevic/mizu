@@ -1,6 +1,7 @@
 package health
 
 import (
+	"cmp"
 	"io"
 
 	"context"
@@ -756,25 +757,21 @@ func (s *Server) renewCertHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	domain := r.URL.Query().Get("domain")
-	keyType := r.URL.Query().Get("key_type")
-
-	if domain == "" {
-		// Try reading from JSON body
-		var body struct {
-			Domain  string `json:"domain"`
-			KeyType string `json:"key_type"`
-		}
-		if r.Body != nil {
-			json.NewDecoder(io.LimitReader(r.Body, 1024)).Decode(&body)
-			domain = body.Domain
-			// The query wins: taking both would ask for the same key type twice,
-			// and each ask is an order against the duplicate-certificate limit.
-			if keyType == "" {
-				keyType = body.KeyType
-			}
-		}
+	// Each field may come from the query or the body, and the query wins per
+	// field: taking both would ask for the same key type twice, and each ask is
+	// an order against the duplicate-certificate limit. The body is read
+	// whichever way the domain arrived - reading it only when the query had no
+	// domain silently dropped a key_type sent in the body alongside a domain in
+	// the URL, and ordered both key types.
+	var body struct {
+		Domain  string `json:"domain"`
+		KeyType string `json:"key_type"`
 	}
+	if r.Body != nil {
+		json.NewDecoder(io.LimitReader(r.Body, 1024)).Decode(&body)
+	}
+	domain := cmp.Or(r.URL.Query().Get("domain"), body.Domain)
+	keyType := cmp.Or(r.URL.Query().Get("key_type"), body.KeyType)
 
 	var keyTypes []string
 	if keyType != "" {

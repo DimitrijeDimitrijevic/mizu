@@ -13,6 +13,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"golang.org/x/crypto/acme/autocert"
 	"io"
 	"math/big"
 	"net/http"
@@ -30,7 +31,8 @@ type fakeCA struct {
 	key        *ecdsa.PrivateKey
 	cert       *x509.Certificate
 	issued     atomic.Int32
-	afterIssue func() // test hook, called once a certificate has been signed
+	afterIssue func()                              // test hook, called once a certificate has been signed
+	refuse     func(*x509.CertificateRequest) bool // test hook, refuses a finalize
 
 	mu    sync.Mutex
 	certs map[string][]byte // cert URL path -> PEM chain
@@ -84,7 +86,10 @@ func (ca *fakeCA) RoundTrip(req *http.Request) (*http.Response, error) {
 	case path == "/new-order":
 		return respond(http.StatusCreated, base+"/order/1", []byte(`{"status":"ready","authorizations":[],"finalize":"`+base+`/finalize"}`))
 	case path == "/finalize":
-		certPath := ca.issue(req)
+		certPath, ok := ca.issue(req)
+		if !ok {
+			return respond(http.StatusForbidden, "", []byte(`{"type":"urn:ietf:params:acme:error:unauthorized","detail":"test: refused"}`))
+		}
 		return respond(http.StatusOK, base+"/order/1", []byte(`{"status":"valid","certificate":"`+base+certPath+`"}`))
 	case strings.HasPrefix(path, "/cert/"):
 		ca.mu.Lock()
@@ -95,8 +100,9 @@ func (ca *fakeCA) RoundTrip(req *http.Request) (*http.Response, error) {
 	return respond(http.StatusNotFound, "", []byte(`{"type":"urn:ietf:params:acme:error:malformed","detail":"unknown path"}`))
 }
 
-// issue signs the CSR carried in a finalize request and returns the cert's path.
-func (ca *fakeCA) issue(req *http.Request) string {
+// issue signs the CSR carried in a finalize request and returns the cert's
+// path, or false when the refuse hook turned it down.
+func (ca *fakeCA) issue(req *http.Request) (string, bool) {
 	var jws struct{ Payload string }
 	if err := json.NewDecoder(req.Body).Decode(&jws); err != nil {
 		ca.t.Errorf("fakeCA: bad JWS: %v", err)
@@ -108,7 +114,10 @@ func (ca *fakeCA) issue(req *http.Request) string {
 	csr, err := x509.ParseCertificateRequest(csrDER)
 	if err != nil {
 		ca.t.Errorf("fakeCA: bad CSR: %v", err)
-		return "/cert/none"
+		return "/cert/none", true
+	}
+	if ca.refuse != nil && ca.refuse(csr) {
+		return "", false
 	}
 
 	n := ca.issued.Add(1)
@@ -136,7 +145,7 @@ func (ca *fakeCA) issue(req *http.Request) string {
 	if hook != nil {
 		hook()
 	}
-	return certPath
+	return certPath, true
 }
 
 func always(v bool) func() bool { return func() bool { return v } }
@@ -261,8 +270,10 @@ func TestAdoptNewerFromCache(t *testing.T) {
 	seedCerts(t, cache, domain, time.Now().Add(70*24*time.Hour))
 
 	m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(false), domain)
-	m.maintainCertificates() // loads the certificates and records what is served
+	m.maintainCertificates()
+	// A handshake: autocert loads the certificate and the wrapper records it.
 	old := mustServedLeaf(t, m, domain, "ecdsa")
+	m.recordServed(domain, "ecdsa", old, true)
 
 	newer := cacheEntry(t, domain, false, time.Now().Add(89*24*time.Hour))
 	cache.Put(context.Background(), certCacheKey(domain, "ecdsa"), newer)
@@ -412,7 +423,7 @@ func TestReloadIgnoresExpiredCertificateHeldInMemory(t *testing.T) {
 	m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(false), stuck, renewed)
 	m.maintainCertificates()
 	// This node loaded stuck.example.com before it expired and is still serving it.
-	m.recordServed(stuck, "ecdsa", entryLeaf(t, expired))
+	m.recordServed(stuck, "ecdsa", entryLeaf(t, expired), true)
 
 	if err := m.reload("renewed " + renewed); err != nil {
 		t.Fatalf("reload refused over an unrelated expired certificate: %v", err)
@@ -796,5 +807,115 @@ func TestUnicodeDomainPassesTheHostPolicy(t *testing.T) {
 	if _, err := m.RenewCertificate(context.Background(), unicode, "ecdsa"); err != nil &&
 		strings.Contains(err.Error(), "not in allowed list") {
 		t.Errorf("RenewCertificate rejected a configured Unicode domain: %v", err)
+	}
+}
+
+// On a non-leader the maintenance walk read the cache and recorded that as
+// "served", so adoptNewerFromCache compared the cache with itself and never saw
+// a difference — while autocert went on handing out the certificate it had
+// loaded at the first handshake. A certificate the leader replaced early never
+// reached the other nodes, contrary to what the docs promised.
+func TestMaintenanceAdoptsANewerCertificateOnANonLeader(t *testing.T) {
+	const domain = "mx.example.com"
+	cache := newMemCache()
+	seedCerts(t, cache, domain, time.Now().Add(70*24*time.Hour))
+
+	m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(false), domain)
+	m.maintainCertificates()
+
+	// A handshake: autocert loads the certificate and the wrapper records it.
+	old := mustServedLeaf(t, m, domain, "ecdsa")
+	m.recordServed(domain, "ecdsa", old, true)
+
+	// The leader replaces it (renew-cert) while this node keeps serving from memory.
+	cache.Put(context.Background(), certCacheKey(domain, "ecdsa"),
+		cacheEntry(t, domain, false, time.Now().Add(89*24*time.Hour)))
+
+	m.maintainCertificates()
+
+	got := mustServedLeaf(t, m, domain, "ecdsa")
+	if bytes.Equal(got.Raw, old.Raw) {
+		t.Fatal("the hourly pass left the node serving the replaced certificate")
+	}
+}
+
+// The expiry a non-leader exports is the certificate it hands out, which is
+// what autocert holds — not what the cache holds. Outside the renewal window
+// autocert does not look at the cache, so an older entry appearing there (a
+// bucket restored from a backup) changes nothing about what is served.
+func TestNonLeaderRecordsWhatItServesNotWhatTheCacheHolds(t *testing.T) {
+	const domain = "mx.example.com"
+	cache := newMemCache()
+	seedCerts(t, cache, domain, time.Now().Add(70*24*time.Hour))
+
+	m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(false), domain)
+	served := mustServedLeaf(t, m, domain, "rsa")
+	m.recordServed(domain, "rsa", served, true)
+
+	cache.Put(context.Background(), certCacheKey(domain, "rsa"),
+		cacheEntry(t, domain, true, time.Now().Add(60*24*time.Hour)))
+	m.maintainCertificates()
+
+	rec, ok := m.served.Load(certCacheKey(domain, "rsa"))
+	if !ok {
+		t.Fatal("no record for the served certificate")
+	}
+	if got := rec.(certRecord).leaf; !bytes.Equal(got.Raw, served.Raw) {
+		t.Errorf("record holds the cache's certificate (expires %s), want the served one (expires %s)",
+			got.NotAfter, served.NotAfter)
+	}
+}
+
+// A renewal that issued one key type and then failed to load it must not read
+// as "everything issued, only the swap failed": the operator would be told not
+// to re-run it, and the key type that was never issued stays missing.
+func TestRenewCertificatePartialFailureIsNotReportedAsStored(t *testing.T) {
+	const domain, other = "mx.example.com", "mx2.example.com"
+	cache := newMemCache()
+	seedCerts(t, cache, domain, time.Now().Add(80*24*time.Hour))
+	seedCerts(t, cache, other, time.Now().Add(80*24*time.Hour))
+
+	ca := newFakeCA(t)
+	ca.refuse = func(csr *x509.CertificateRequest) bool { return csr.PublicKeyAlgorithm == x509.RSA }
+	m := newTestManager(cache, ca, always(true), domain, other)
+	m.maintainCertificates()
+
+	// The reload will fail: a served certificate is no longer loadable.
+	cache.Delete(context.Background(), certCacheKey(other, "ecdsa"))
+
+	renewed, err := m.RenewCertificate(context.Background(), domain)
+	if len(renewed) != 1 {
+		t.Fatalf("renewed %v, want the ECDSA certificate only", renewed)
+	}
+	if err == nil {
+		t.Fatal("no error although RSA was refused and the reload failed")
+	}
+	if errors.Is(err, ErrNotInService) {
+		t.Errorf("error reads as 'stored, do not re-run': %v", err)
+	}
+}
+
+// The throwaway orderer hides the key it is replacing so that autocert orders
+// instead of loading. Hiding it for good left the orderer's renewal timer with
+// nothing to load when it fired, so it tried to order — refused — and retried
+// every half hour for the rest of the process. Retiring the orderer must also
+// stop hiding.
+func TestRetiredOrdererSeesTheCacheAgain(t *testing.T) {
+	const domain = "mx.example.com"
+	cache := newMemCache()
+	seedCerts(t, cache, domain, time.Now().Add(80*24*time.Hour))
+	key := certCacheKey(domain, "ecdsa")
+
+	m := newTestManager(cache, &countingTransport{resp: refuseAll}, always(true), domain)
+	orderer := m.newOrderer(map[string]struct{}{key: {}})
+
+	if _, err := orderer.mgr.Cache.Get(context.Background(), key); err != autocert.ErrCacheMiss {
+		t.Fatalf("Get before retire: err = %v, want ErrCacheMiss", err)
+	}
+
+	orderer.retire()
+
+	if _, err := orderer.mgr.Cache.Get(context.Background(), key); err != nil {
+		t.Errorf("Get after retire: %v, want the cached certificate", err)
 	}
 }
