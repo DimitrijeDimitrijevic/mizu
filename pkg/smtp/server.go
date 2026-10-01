@@ -1139,6 +1139,13 @@ func (s *Session) Mail(ctx context.Context, from string, opts *smtp.MailOptions)
 		}
 	}
 
+	// SMTPUTF8 is not supported (see ErrNonASCIIAddress): refuse the address
+	// now rather than accept a message nothing downstream can deliver.
+	if !isASCII(from) {
+		s.Logger.Warn("Rejecting MAIL FROM - non-ASCII address", "from", from)
+		return ErrNonASCIIAddress
+	}
+
 	// Update and check TLS state (skip in local mode)
 	s.updateTLSState()
 	if !s.globalConfig.Local && s.serverConfig.TLS.Required && s.tlsState == nil {
@@ -1405,6 +1412,12 @@ func (s *Session) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) e
 			EnhancedCode: smtp.EnhancedCode{5, 5, 1},
 			Message:      "bad sequence of commands - MAIL FROM first",
 		}
+	}
+
+	// SMTPUTF8 is not supported (see ErrNonASCIIAddress).
+	if !isASCII(to) {
+		s.Logger.Warn("Rejecting RCPT TO - non-ASCII address", "to", to)
+		return ErrNonASCIIAddress
 	}
 
 	// Update and check TLS state (skip in local mode)
@@ -2369,4 +2382,15 @@ func tlsVersionString(version uint16) string {
 	default:
 		return fmt.Sprintf("Unknown (0x%x)", version)
 	}
+}
+
+// isASCII reports whether every byte of s is 7-bit. An envelope address that
+// fails this needs SMTPUTF8, which Mizu does not offer.
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
 }

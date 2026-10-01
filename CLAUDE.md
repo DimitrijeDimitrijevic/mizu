@@ -396,6 +396,24 @@ Key packages:
   fallback). Unknown/stale config keys produce a startup stderr warning
   (`warnUndecodedKeys` in [pkg/config/loader.go](pkg/config/loader.go))
 
+**SMTPUTF8 is not supported (RFC 6531):**
+- Recipient lookups are byte-exact with no IDNA normalisation and the LMTP
+  backend takes ASCII addresses only, so an internationalised message
+  accepted at SMTP time fails after the `250`. `applyEhloCompat`
+  ([cmd/mizu-server/main.go](cmd/mizu-server/main.go)) therefore leaves the
+  capability off: it is not advertised and `MAIL FROM:<...> SMTPUTF8` gets
+  `504 5.5.4` from go-smtp.
+- **Not advertising is only half of it.** The go-smtp address parser copies
+  raw bytes, so a UTF-8 address sent *without* the parameter still reaches
+  the session. `Session.Mail` and `Session.Rcpt` refuse any non-ASCII
+  envelope address with `553 5.6.7` (`ErrNonASCIIAddress`,
+  [pkg/smtp/errors.go](pkg/smtp/errors.go)), the reply RFC 6531 §3.7.1
+  prescribes. The former `smtputf8 = true` knob was dropped rather than kept:
+  it accepted the parameter and discarded it, so an operator could enable
+  "support" and get nothing. Offering the extension needs, together: the
+  `Received` protocol token `UTF8SMTP[S][A]` (RFC 6531 §4.3), a marker in the
+  delivery POST the backend can act on, and backend EAI support.
+
 **Received header privacy (`strip_client_identity`):**
 - Per-server `[[server]]` `*bool` that omits the `from <HELO> (<client IP>)`
   clause from the `Received` header this server stamps, yielding

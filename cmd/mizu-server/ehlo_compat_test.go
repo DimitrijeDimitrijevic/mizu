@@ -73,3 +73,20 @@ func TestApplyEhloCompatRelayNoLegacyAuth(t *testing.T) {
 		t.Fatal("LIMITS must be suppressed by default on relay servers too")
 	}
 }
+
+// SMTPUTF8 is never offered: the session refuses non-ASCII addresses
+// (pkg/smtp), and advertising the extension would invite them.
+func TestApplyEhloCompatSMTPUTF8Off(t *testing.T) {
+	for _, typ := range []string{"submission", "relay"} {
+		cfg := &config.ServerConfig{Type: typ, Name: "test-" + typ}
+		cfg.ApplyDefaults(config.DefaultsConfig{})
+
+		server := gosmtp.NewServer(nil)
+		server.EnableSMTPUTF8 = true // must be overridden, not merely left alone
+		applyEhloCompat(server, cfg)
+
+		if server.EnableSMTPUTF8 {
+			t.Fatalf("%s server must not offer SMTPUTF8", typ)
+		}
+	}
+}

@@ -1343,6 +1343,16 @@ func applyEhloCompat(server *gosmtp.Server, serverCfg *config.ServerConfig) {
 	// extension is young and can confuse client capability parsers.
 	server.DisableLimitsCap = !serverCfg.AdvertiseLimits
 
+	// SMTPUTF8 (RFC 6531) is not offered: recipient lookups are byte-exact
+	// with no IDNA normalisation and the LMTP backend takes ASCII addresses
+	// only, so an internationalised message accepted here fails after the
+	// 250. Not advertising is only half of it — the parser still takes raw
+	// UTF-8 without the parameter — so Session.Mail and Session.Rcpt refuse
+	// any non-ASCII address with 553 5.6.7 (pkg/smtp/server.go). Offer the
+	// extension only together with the Received stamp (UTF8SMTP, RFC 6531
+	// §4.3) and a marker the backend can act on.
+	server.EnableSMTPUTF8 = false
+
 	// Obsolete "AUTH=" EHLO line for Microsoft Outlook lineages, which refuse
 	// to attempt AUTH when only the RFC-conformant form is present (Postfix's
 	// broken_sasl_auth_clients; the August 2026 new-Outlook incident). Only
@@ -1360,7 +1370,6 @@ func runSMTPServerInstance(ctx context.Context, serverCfg *config.ServerConfig, 
 	server.ReadTimeout = time.Duration(serverCfg.TimeoutSeconds) * time.Second
 	server.WriteTimeout = time.Duration(serverCfg.TimeoutSeconds) * time.Second
 	server.MaxMessageBytes = int64(serverCfg.MaxMessageSize)
-	server.EnableSMTPUTF8 = true
 	server.MaxRecipients = serverCfg.MaxRecipientsPerMessage
 	applyEhloCompat(server, serverCfg)
 

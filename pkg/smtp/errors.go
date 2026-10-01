@@ -28,6 +28,18 @@ var (
 		Message:      "Must issue a STARTTLS command first",
 	}
 
+	// ErrNonASCIIAddress: an envelope address with a byte outside ASCII.
+	// SMTPUTF8 is not advertised (applyEhloCompat in cmd/mizu-server) and
+	// nothing downstream can deliver an internationalised address, but the
+	// go-smtp parser accepts raw UTF-8 with or without the parameter, so the
+	// session has to refuse it. 553 5.6.7 is the reply RFC 6531 §3.7.1
+	// prescribes for an address that needs SMTPUTF8 when it is not in use.
+	ErrNonASCIIAddress = &smtp.SMTPError{
+		Code:         553,
+		EnhancedCode: smtp.EnhancedCode{5, 6, 7},
+		Message:      "non-ASCII addresses not permitted: SMTPUTF8 not supported",
+	}
+
 	// Authentication errors. Structured SMTPErrors so the auth-failure code is
 	// correct per RFC 4954 §6, which Outlook's setup wizard relies on: a
 	// permanent 535 is a password prompt, a temporary 454 is read as "server
