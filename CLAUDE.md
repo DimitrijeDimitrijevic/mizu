@@ -396,6 +396,17 @@ Key packages:
   fallback). Unknown/stale config keys produce a startup stderr warning
   (`warnUndecodedKeys` in [pkg/config/loader.go](pkg/config/loader.go))
 
+**SMTPUTF8 (`smtputf8`):**
+- Per-server `[[server]]` `bool`, default **false**. When true the server
+  advertises `SMTPUTF8` (RFC 6531) in EHLO and accepts the `SMTPUTF8`
+  parameter on `MAIL FROM`; when false the capability is not advertised and
+  `MAIL FROM:<...> SMTPUTF8` is refused with `504 5.5.4`. Mapped onto the
+  go-smtp server in `applyEhloCompat`
+  ([cmd/mizu-server/main.go](cmd/mizu-server/main.go)); read at startup, so a
+  change needs a restart.
+- The go-smtp address parser does not enforce this flag: a raw UTF-8 address
+  sent without the `SMTPUTF8` parameter is still accepted.
+
 **Received header privacy (`strip_client_identity`):**
 - Per-server `[[server]]` `*bool` that omits the `from <HELO> (<client IP>)`
   clause from the `Received` header this server stamps, yielding

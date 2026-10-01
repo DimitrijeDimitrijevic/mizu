@@ -289,7 +289,8 @@ func main() {
 			"name", serverCfg.Name,
 			"type", serverCfg.Type,
 			"listen_addr", serverCfg.ListenAddr,
-			"tls", serverCfg.TLS.Mode)
+			"tls", serverCfg.TLS.Mode,
+			"smtputf8", serverCfg.SMTPUTF8)
 
 		// Initialize sender validator if enabled for this server
 		var senderValidator smtp.SenderValidator
@@ -1343,6 +1344,10 @@ func applyEhloCompat(server *gosmtp.Server, serverCfg *config.ServerConfig) {
 	// extension is young and can confuse client capability parsers.
 	server.DisableLimitsCap = !serverCfg.AdvertiseLimits
 
+	// SMTPUTF8 (RFC 6531) is advertised, and accepted on MAIL FROM, only when
+	// enabled in config; off by default.
+	server.EnableSMTPUTF8 = serverCfg.SMTPUTF8
+
 	// Obsolete "AUTH=" EHLO line for Microsoft Outlook lineages, which refuse
 	// to attempt AUTH when only the RFC-conformant form is present (Postfix's
 	// broken_sasl_auth_clients; the August 2026 new-Outlook incident). Only
@@ -1360,7 +1365,6 @@ func runSMTPServerInstance(ctx context.Context, serverCfg *config.ServerConfig, 
 	server.ReadTimeout = time.Duration(serverCfg.TimeoutSeconds) * time.Second
 	server.WriteTimeout = time.Duration(serverCfg.TimeoutSeconds) * time.Second
 	server.MaxMessageBytes = int64(serverCfg.MaxMessageSize)
-	server.EnableSMTPUTF8 = true
 	server.MaxRecipients = serverCfg.MaxRecipientsPerMessage
 	applyEhloCompat(server, serverCfg)
 
