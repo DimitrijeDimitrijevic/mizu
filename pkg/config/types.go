@@ -90,10 +90,6 @@ type ServerConfig struct {
 	// default: the extension is young and can confuse client capability
 	// parsers. Default: false.
 	AdvertiseLimits bool `toml:"advertise_limits"`
-	// SMTPUTF8 advertises the SMTPUTF8 (RFC 6531) EHLO capability and accepts
-	// the SMTPUTF8 MAIL FROM parameter. When false, the capability is not
-	// advertised and MAIL FROM ... SMTPUTF8 gets 504 5.5.4. Default: false.
-	SMTPUTF8 bool `toml:"smtputf8"`
 
 	// === Debugging ===
 	Debug bool `toml:"debug"` // Enable SMTP protocol debug logging (shows all SMTP commands and responses)

@@ -48,19 +48,7 @@ func TestAdvertiseLimitsDefaultsFalse(t *testing.T) {
 	}
 }
 
-// SMTPUTF8 advertisement must default to OFF on every server type.
-func TestSMTPUTF8DefaultsFalse(t *testing.T) {
-	for _, typ := range []string{"submission", "relay"} {
-		s := &ServerConfig{Type: typ}
-		s.ApplyDefaults(DefaultsConfig{})
-
-		if s.SMTPUTF8 {
-			t.Fatalf("SMTPUTF8 must default to false on %s servers", typ)
-		}
-	}
-}
-
-// TOML parsing of the knobs.
+// TOML parsing of both knobs.
 func TestEhloCompatTOMLParsing(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.toml")
@@ -71,7 +59,6 @@ type = "submission"
 listen_addr = ":465"
 legacy_auth_cap = false
 advertise_limits = true
-smtputf8 = true
 `), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -90,13 +77,10 @@ smtputf8 = true
 	if !s.AdvertiseLimits {
 		t.Fatal("advertise_limits = true not parsed")
 	}
-	if !s.SMTPUTF8 {
-		t.Fatal("smtputf8 = true not parsed")
-	}
 }
 
 // The default TOML surface (knobs omitted) must land on the compatible
-// defaults after ApplyDefaults: legacy AUTH= on, LIMITS off, SMTPUTF8 off.
+// defaults after ApplyDefaults: legacy AUTH= on, LIMITS off.
 func TestEhloCompatTOMLDefaults(t *testing.T) {
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.toml")
@@ -120,9 +104,6 @@ listen_addr = ":465"
 	}
 	if s.AdvertiseLimits {
 		t.Fatal("advertise_limits must default to false")
-	}
-	if s.SMTPUTF8 {
-		t.Fatal("smtputf8 must default to false")
 	}
 }
 
