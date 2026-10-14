@@ -1,13 +1,177 @@
-server = []
 local = false
+
+[[server]]
+name = "mx-primary"
+type = "relay"
+listen_addr = ":25"
+hostname = "mail.example.com"
+proxy_protocol = false
+proxy_protocol_trusted = []
+max_message_size = 26214400
+max_recipients_per_message = 100
+timeout_seconds = 300
+shutdown_timeout_seconds = 60
+legacy_auth_cap = true
+advertise_limits = false
+debug = false
+enable_trace_id_header = true
+enable_auth_results_header = true
+enable_junk_header = true
+strip_client_identity = false
+helo_validation = true
+spf_check = false
+dkim_check = false
+arc_check = false
+dmarc_check = false
+dmarc_reject_action = "reject"
+dmarc_quarantine_action = "junk"
+[server.limits]
+max_connections = 100
+max_connections_per_ip = 0
+max_connections_per_user = 0
+max_connection_duration_seconds = 300
+[server.tls]
+enabled = true
+mode = "starttls"
+required = false
+min_tls_version = "1.2"
+max_tls_version = ""
+extra_cipher_suites = []
+[server.validation]
+allow_null_sender = true
+missing_headers_action = "fix"
+loop_detection = true
+max_hops = 30
+[server.reputation]
+enabled = true
+min_ip_score = -0.2
+min_domain_score = -0.2
+reject_code = 421
+reject_message = "poor reputation, please try again later"
+whitelist_ips = []
+whitelist_hosts = []
+[server.reputation.dnsbl]
+enabled = false
+ipv4_lists = []
+ipv6_lists = []
+timeout_seconds = 3
+weight = 5
+[server.auth]
+enabled = false
+required = false
+url = ""
+auth_token = ""
+[server.auth.cache]
+enabled = true
+positive_ttl = "5m"
+negative_ttl = "1m"
+max_size = 50000
+cleanup_interval = "5m"
+positive_revalidation_window = "30s"
+[server.auth.rate_limit]
+enabled = true
+max_attempts_per_ip_username = 5
+ip_username_block_duration = "15m"
+ip_username_window_duration = "10m"
+max_attempts_per_ip = 50
+ip_block_duration = "30m"
+ip_window_duration = "30m"
+subnet_max_distinct_ips = 8
+subnet_min_failures = 15
+subnet_window_duration = "30m"
+subnet_block_duration = "30m"
+subnet_ipv4_prefix = 24
+subnet_ipv6_prefix = 48
+subnet_exempt = []
+success_exempt_duration = "24h"
+max_attempts_per_username = 100
+username_window_duration = "1h"
+delay_start_threshold = 3
+initial_delay = "1s"
+max_delay = "30s"
+delay_multiplier = 2.0
+cache_cleanup_interval = "5m"
+max_ip_username_entries = 100000
+max_ip_entries = 50000
+max_username_entries = 50000
+max_subnet_entries = 10000
+cluster_sync_enabled = true
+sync_blocks = true
+sync_failure_counts = true
+[server.dns_checks]
+require_rdns = false
+require_sender_mx = false
+require_resolvable_helo = false
+rdns_whitelist_ips = []
+[server.junk]
+reject_null_sender = false
+check_headers = []
+apply_action = "header"
+subject_pattern = "[spam] %s"
+header = "X-Spam"
+[server.spam_check]
+enabled = false
+url = "http://rspamd:11333/checkv2"
+password = ""
+http_timeout_seconds = 15
+spam_header = "X-Junk"
+spam_header_value = "yes"
+ham_header_value = ""
+reject_on_action = ""
+[server.rate_limit]
+enabled = false
+gossip_enabled = false
+gossip_interval_seconds = 5
+whitelisted_ips = []
+whitelisted_domains = []
+whitelisted_senders = []
+whitelisted_ips_file = ""
+whitelisted_domains_file = ""
+whitelisted_senders_file = ""
+whitelist_reload_interval_seconds = 10
+
+[[server.rate_limit.dimensions]]
+name = "per-ip"
+keys = ["IP"]
+limit = 100
+window_seconds = 60
+[server.distributed]
+enabled = false
+global_max_per_ip = 0
+gossip_interval_seconds = 5
+s3_sync_interval_seconds = 30
+recipient_cache_ttl_seconds = 900
+[server.sender_validation]
+enabled = false
+url = "https://backend.example.com/validate/sender?from=$from&ip=$ip"
+auth_token = ""
+http_timeout_seconds = 5
+cache_ttl_seconds = 300
+[server.recipient_validation]
+enabled = false
+url = "https://backend.example.com/validate/recipient?email=$email&from=$from&ip=$ip"
+auth_token = ""
+http_timeout_seconds = 5
+cache_ttl_seconds = 300
+[server.delivery]
+url = "https://backend.example.com/deliver"
+auth_token = ""
+max_retry_attempts = 3
+http_timeout_seconds = 30
+max_idle_conns_per_host = 100
+max_conns_per_host = 0
+idle_conn_timeout_seconds = 90
+[server.delivery.circuit_breaker]
+enabled = true
+failure_threshold = 5
+success_threshold = 2
+timeout_seconds = 30
+half_open_max_calls = 1
+reset_timeout_seconds = 60
 
 [defaults]
 hostname = "mail.example.com"
 max_message_size = 26214400
-# How long to wait for the next SMTP command. RFC 5321 §4.5.3.2.7 requires at
-# least 5 minutes; shorter values drop clients that pause between commands
-# (slow reverse-DNS before EHLO, laggy uplinks) with no real DoS benefit —
-# bound concurrency with max_connections / max_connections_per_ip instead.
 timeout_seconds = 300
 shutdown_timeout_seconds = 60
 max_connections = 100

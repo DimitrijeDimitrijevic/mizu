@@ -151,6 +151,7 @@ func applyEnvironmentVariables(cfg *Config) {
 // SaveExample saves an example configuration file
 func SaveExample(filename string) error {
 	exampleConfig := DefaultConfig()
+	exampleConfig.Servers = []ServerConfig{exampleServer()}
 
 	// Create example config with comments
 	f, err := os.Create(filename)

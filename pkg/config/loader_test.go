@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/BurntSushi/toml"
 )
 
 func TestLoadConfig_Defaults(t *testing.T) {
@@ -682,4 +684,29 @@ func TestValidateConfig_MaxMessageSize(t *testing.T) {
 			t.Errorf("expected no error at ceiling, got: %v", err)
 		}
 	})
+}
+
+// TestGeneratedExampleLoads guards generate-config: the example it writes must
+// decode with no unknown keys and pass validation, so the documented server
+// section cannot drift from the struct or from what Validate accepts.
+func TestGeneratedExampleLoads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml.example")
+	if err := SaveExample(path); err != nil {
+		t.Fatalf("SaveExample: %v", err)
+	}
+
+	cfg := DefaultConfig()
+	md, err := toml.DecodeFile(path, &cfg)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if undecoded := md.Undecoded(); len(undecoded) > 0 {
+		t.Fatalf("example contains keys no field accepts: %v", undecoded)
+	}
+	if len(cfg.Servers) != 1 {
+		t.Fatalf("expected one example server, got %d", len(cfg.Servers))
+	}
+	if err := cfg.Servers[0].Validate(); err != nil {
+		t.Fatalf("example server does not validate: %v", err)
+	}
 }
