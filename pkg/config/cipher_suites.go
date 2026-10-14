@@ -7,14 +7,26 @@ import (
 	"strings"
 )
 
+// usableBelowTLS13 reports whether cs can be negotiated under TLS 1.0-1.2.
+// crypto/tls lists its TLS 1.3 suites alongside them, but ignores
+// Config.CipherSuites for 1.3, so naming one would be accepted and do nothing.
+func usableBelowTLS13(cs *tls.CipherSuite) bool {
+	return slices.ContainsFunc(cs.SupportedVersions, func(v uint16) bool {
+		return v < tls.VersionTLS13
+	})
+}
+
 // cipherSuitesByName indexes every TLS 1.0-1.2 cipher suite crypto/tls implements
 // — secure and insecure alike — by its Go name. The insecure ones are included
-// deliberately: they are the whole point of extra_cipher_suites.
+// deliberately: they are the whole point of extra_cipher_suites. TLS 1.3 suites
+// are excluded, so naming one fails startup instead of silently doing nothing.
 var cipherSuitesByName = func() map[string]uint16 {
 	all := append(tls.CipherSuites(), tls.InsecureCipherSuites()...)
 	m := make(map[string]uint16, len(all))
 	for _, cs := range all {
-		m[cs.Name] = cs.ID
+		if usableBelowTLS13(cs) {
+			m[cs.Name] = cs.ID
+		}
 	}
 	return m
 }()
@@ -27,7 +39,9 @@ var secureCipherSuiteIDs = func() []uint16 {
 	secure := tls.CipherSuites()
 	ids := make([]uint16, 0, len(secure))
 	for _, cs := range secure {
-		ids = append(ids, cs.ID)
+		if usableBelowTLS13(cs) {
+			ids = append(ids, cs.ID)
+		}
 	}
 	return ids
 }()

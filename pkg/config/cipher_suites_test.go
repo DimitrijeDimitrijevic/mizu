@@ -64,6 +64,15 @@ func TestResolveCipherSuites(t *testing.T) {
 		}
 	})
 
+	t.Run("rejects TLS 1.3 suites", func(t *testing.T) {
+		// Go ignores CipherSuites for TLS 1.3, so accepting one would let an
+		// operator believe they had configured something.
+		_, err := resolveCipherSuites([]string{"TLS_AES_128_GCM_SHA256"})
+		if err == nil {
+			t.Fatal("expected an error for a TLS 1.3 suite")
+		}
+	})
+
 	t.Run("rejects unknown names", func(t *testing.T) {
 		// A typo must fail startup rather than silently leaving the appliance
 		// unable to connect.
