@@ -517,6 +517,13 @@ Key packages:
   - Known trade-off: 535 vs 454 is a mailbox-enumeration oracle on the
     submission port, accepted so clients can distinguish "no such address" from
     "server down". The `AuthRateLimiter` tiers bound the probing.
+- **The header From is authorized, not just the envelope**
+  (`authorizeHeaderSenders`, called from `validateHeaders`). Every address in
+  `From` and `Sender` goes through `ResolveSender` — the same `allowed_from`
+  verdict as MAIL FROM — and a failure is 550 5.7.1. Envelope and header need not
+  be equal (VERP, aliases); each must be authorized. An unparseable header or a
+  second `From` is rejected for authenticated sessions. Before this the header was
+  unchecked, so a mailbox could present as any other and get it DKIM-signed.
 - `allowed_from` entries may be exact addresses, `*@domain` wildcards, or
   `/regex/` patterns (rcptd's regex_sender_login pass-through, matched
   case-insensitively against MAIL FROM with substring semantics like Postfix pcre)

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	net_http "net/http"
 	"net/mail"
@@ -2214,6 +2215,12 @@ func (s *Session) validateHeaders(rawEmail string) error {
 		return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 7, 1}, Message: "missing required From header"}
 	}
 
+	// An authenticated user may only appear as a sender they are authorized for;
+	// the envelope was checked at MAIL FROM, the header is checked here.
+	if err := s.authorizeHeaderSenders(headers); err != nil {
+		return err
+	}
+
 	// Handle missing Date and Message-ID headers based on config
 	_, hasDate := headers["Date"]
 	_, hasMessageID := headers["Message-Id"]
@@ -2272,6 +2279,64 @@ func (s *Session) validateHeaders(rawEmail string) error {
 			s.isJunk = true
 			s.junkReasons = append(s.junkReasons, "invalid Date header format")
 			s.Logger.Info("Marking as junk - invalid Date format", "from", s.from, "error", err)
+		}
+	}
+
+	return nil
+}
+
+// headerAddressParser parses address headers for authorization only. The
+// display name is discarded, so encoded words in any charset are passed through
+// undecoded: net/mail's default decoder knows only UTF-8, US-ASCII and
+// ISO-8859-1 and fails the whole header on anything else, which would reject
+// ordinary mail from clients that encode names in windows-1252 or iso-8859-2.
+var headerAddressParser = mail.AddressParser{WordDecoder: &mime.WordDecoder{
+	CharsetReader: func(_ string, input io.Reader) (io.Reader, error) { return input, nil },
+}}
+
+// authorizeHeaderSenders enforces that every address in the From (and Sender)
+// header is one the authenticated user may send as. MAIL FROM is checked
+// against allowed_from at the MAIL command, but the header is what recipients
+// see and what DKIM/DMARC align to, so it needs the same verdict — otherwise a
+// mailbox could pass the envelope check and still present as any other mailbox.
+//
+// It is a no-op for unauthenticated sessions (relay), which have no
+// allowed_from to enforce. For authenticated sessions anything that cannot be
+// parsed into addresses is rejected rather than waved through, and so is a
+// second From header, since a verdict on the first says nothing about the one a
+// recipient's client may display.
+func (s *Session) authorizeHeaderSenders(headers mail.Header) error {
+	if !s.isAuthenticated || s.authenticator == nil {
+		return nil
+	}
+
+	reject := func(reason, header string, attrs ...any) error {
+		s.Logger.Warn("Rejecting message - "+reason,
+			append([]any{"user", s.authenticatedUser, "header", header, "from", s.from}, attrs...)...)
+		return &smtp.SMTPError{
+			Code:         550,
+			EnhancedCode: smtp.EnhancedCode{5, 7, 1},
+			Message:      "sender address rejected: not allowed",
+		}
+	}
+
+	if len(headers["From"]) > 1 {
+		return reject("multiple From headers", "From")
+	}
+
+	for _, name := range []string{"From", "Sender"} {
+		values := headers[name]
+		if len(values) == 0 {
+			continue
+		}
+		addrs, err := headerAddressParser.ParseList(values[0])
+		if err != nil || len(addrs) == 0 {
+			return reject("unparseable "+name+" header", name, "error", err)
+		}
+		for _, addr := range addrs {
+			if _, ok := s.authenticator.ResolveSender(s.authenticatedUser, addr.Address); !ok {
+				return reject(name+" header address not allowed", name, "address", addr.Address)
+			}
 		}
 	}
 
