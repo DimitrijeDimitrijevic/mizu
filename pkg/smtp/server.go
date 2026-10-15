@@ -2311,8 +2311,13 @@ func (s *Session) authorizeHeaderSenders(headers mail.Header) error {
 	}
 
 	reject := func(reason, header string, attrs ...any) error {
+		// "from" is the envelope sender; the header itself goes in "value".
+		value := headers.Get(header)
+		if len(value) > 256 {
+			value = value[:256] + "..."
+		}
 		s.Logger.Warn("Rejecting message - "+reason,
-			append([]any{"user", s.authenticatedUser, "header", header, "from", s.from}, attrs...)...)
+			append([]any{"user", s.authenticatedUser, "header", header, "value", value, "from", s.from}, attrs...)...)
 		return &smtp.SMTPError{
 			Code:         550,
 			EnhancedCode: smtp.EnhancedCode{5, 7, 1},
