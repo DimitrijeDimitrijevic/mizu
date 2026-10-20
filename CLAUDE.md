@@ -524,6 +524,24 @@ Key packages:
   be equal (VERP, aliases); each must be authorized. An unparseable header or a
   second `From` is rejected for authenticated sessions. Before this the header was
   unchecked, so a mailbox could present as any other and get it DKIM-signed.
+  - **An unquoted display name is not malformed** (`parseHeaderAddresses`).
+    `Alfred @ Wear Zoor <a@b>` and `Zoor, Alfred <a@b>` are invalid RFC 5322,
+    but clients that build the header by hand send them, receivers take the
+    angle-addr, and nothing refused them before the header check existed — it
+    broke a customer's working flow the day it shipped (2026-10-15). When the
+    strict parse fails, the header is parsed again from its first `<` with the
+    name dropped; only the address is authorized, so the name's syntax is not
+    our concern. Except where the name could itself be read as an address: a
+    token with text on both sides of an `@` (`ceo@big.example <me@mine>`,
+    `me@mine <me@mine>`) stays malformed, since a lenient receiver may take it
+    as a second sender that the strict path would refuse as unauthorized.
+  - **Malformed is 5.6.0, unauthorized is 5.7.1.** What does not parse even
+    leniently — no angle-addr, an empty group, a second `From`, text after the
+    address — is a client bug and gets `550 5.6.0 malformed From header …`
+    telling the user to quote the name; "not allowed" sent them hunting a
+    missing permission. Rejected rather than accepted as-is: there is no
+    address a receiver could agree on. The reject log carries the raw header
+    as `value`; its `from` field is the envelope.
 - `allowed_from` entries may be exact addresses, `*@domain` wildcards, or
   `/regex/` patterns (rcptd's regex_sender_login pass-through, matched
   case-insensitively against MAIL FROM with substring semantics like Postfix pcre)

@@ -2294,6 +2294,39 @@ var headerAddressParser = mail.AddressParser{WordDecoder: &mime.WordDecoder{
 	CharsetReader: func(_ string, input io.Reader) (io.Reader, error) { return input, nil },
 }}
 
+// parseHeaderAddresses returns the addresses of an address header, for
+// authorization. A header that is valid RFC 5322 is taken as is. One whose
+// display name holds specials left unquoted — "Alfred @ Wear Zoor <a@b>",
+// "Zoor, Alfred <a@b>" — is parsed again from its first '<' with the name
+// dropped: clients that build the header by hand send these, receivers take the
+// angle-addr, and nothing here refused them before the header check existed.
+// Only the address is authorized, so the name's syntax is not our concern.
+//
+// Except where the name could itself be read as an address. A lenient receiver
+// may take "ceo@big.example, Bob, Smith <bob@example.com>" as two senders, one
+// of them unauthorized — the strict path refuses that list, and the fallback
+// must not wave it through. A name holding a token with text on both sides of
+// an '@' therefore stays malformed, and the client has to quote it.
+func parseHeaderAddresses(value string) ([]*mail.Address, error) {
+	addrs, err := headerAddressParser.ParseList(value)
+	if err == nil {
+		return addrs, nil
+	}
+	open := strings.IndexByte(value, '<')
+	if open <= 0 || strings.IndexByte(value[:open], '>') >= 0 {
+		return nil, err
+	}
+	for _, word := range strings.Fields(value[:open]) {
+		if at := strings.IndexByte(word, '@'); at > 0 && at < len(word)-1 {
+			return nil, err
+		}
+	}
+	if addrs, retryErr := headerAddressParser.ParseList(value[open:]); retryErr == nil {
+		return addrs, nil
+	}
+	return nil, err
+}
+
 // authorizeHeaderSenders enforces that every address in the From (and Sender)
 // header is one the authenticated user may send as. MAIL FROM is checked
 // against allowed_from at the MAIL command, but the header is what recipients
@@ -2305,23 +2338,37 @@ var headerAddressParser = mail.AddressParser{WordDecoder: &mime.WordDecoder{
 // parsed into addresses is rejected rather than waved through, and so is a
 // second From header, since a verdict on the first says nothing about the one a
 // recipient's client may display.
+//
+// The two kinds of refusal get different replies. An unauthorized address is
+// 5.7.1. A header that does not parse even leniently (parseHeaderAddresses) is
+// 5.6.0 with a message naming the header: it is a client bug, and "not allowed"
+// would send the user chasing a permission problem they do not have.
 func (s *Session) authorizeHeaderSenders(headers mail.Header) error {
 	if !s.isAuthenticated || s.authenticator == nil {
 		return nil
 	}
 
-	reject := func(reason, header string, attrs ...any) error {
-		s.Logger.Warn("Rejecting message - "+reason,
-			append([]any{"user", s.authenticatedUser, "header", header, "from", s.from}, attrs...)...)
-		return &smtp.SMTPError{
-			Code:         550,
-			EnhancedCode: smtp.EnhancedCode{5, 7, 1},
-			Message:      "sender address rejected: not allowed",
+	reject := func(reason, header string, reply *smtp.SMTPError, attrs ...any) error {
+		// "from" is the envelope sender; the header itself goes in "value".
+		value := headers.Get(header)
+		if len(value) > 256 {
+			value = value[:256] + "..."
 		}
+		s.Logger.Warn("Rejecting message - "+reason,
+			append([]any{"user", s.authenticatedUser, "header", header, "value", value, "from", s.from}, attrs...)...)
+		return reply
+	}
+	malformed := func(message string) *smtp.SMTPError {
+		return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 6, 0}, Message: message}
+	}
+	notAllowed := &smtp.SMTPError{
+		Code:         550,
+		EnhancedCode: smtp.EnhancedCode{5, 7, 1},
+		Message:      "sender address rejected: not allowed",
 	}
 
 	if len(headers["From"]) > 1 {
-		return reject("multiple From headers", "From")
+		return reject("multiple From headers", "From", malformed("malformed message: more than one From header"))
 	}
 
 	for _, name := range []string{"From", "Sender"} {
@@ -2329,13 +2376,15 @@ func (s *Session) authorizeHeaderSenders(headers mail.Header) error {
 		if len(values) == 0 {
 			continue
 		}
-		addrs, err := headerAddressParser.ParseList(values[0])
+		addrs, err := parseHeaderAddresses(values[0])
 		if err != nil || len(addrs) == 0 {
-			return reject("unparseable "+name+" header", name, "error", err)
+			return reject("unparseable "+name+" header", name, malformed("malformed "+name+
+				" header: not a valid address; a display name holding specials or an @ must be quoted"),
+				"error", err)
 		}
 		for _, addr := range addrs {
 			if _, ok := s.authenticator.ResolveSender(s.authenticatedUser, addr.Address); !ok {
-				return reject(name+" header address not allowed", name, "address", addr.Address)
+				return reject(name+" header address not allowed", name, notAllowed, "address", addr.Address)
 			}
 		}
 	}
