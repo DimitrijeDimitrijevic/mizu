@@ -1421,6 +1421,14 @@ func (s *Session) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) e
 		return ErrNonASCIIAddress
 	}
 
+	// A dotless domain cannot be delivered (see ErrRecipientNotFQDN). Refused
+	// here, before the recipient is recorded, so it never reaches the
+	// recipient-validation API, the spam check or the delivery POST.
+	if !hasFQDNDomain(to) {
+		s.Logger.Warn("Rejecting RCPT TO - recipient domain not fully qualified", "to", to)
+		return ErrRecipientNotFQDN
+	}
+
 	// Update and check TLS state (skip in local mode)
 	s.updateTLSState()
 	if !s.globalConfig.Local && s.serverConfig.TLS.Required && s.tlsState == nil {
@@ -2507,4 +2515,24 @@ func isASCII(s string) bool {
 		}
 	}
 	return true
+}
+
+// hasFQDNDomain reports whether the domain of an envelope address is fully
+// qualified (RFC 5321 §2.3.5): non-empty, holding a dot, with no leading,
+// trailing or doubled dot. The rule is the one mailqueuer's
+// emailutil.IsValidEmail applies at ingest, so an address accepted here is
+// not refused after the 250.
+func hasFQDNDomain(addr string) bool {
+	at := strings.LastIndex(addr, "@")
+	if at < 0 {
+		return false
+	}
+	domain := addr[at+1:]
+	if domain == "" || !strings.Contains(domain, ".") {
+		return false
+	}
+	if strings.HasPrefix(domain, ".") || strings.HasSuffix(domain, ".") {
+		return false
+	}
+	return !strings.Contains(domain, "..")
 }

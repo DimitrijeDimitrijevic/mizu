@@ -40,6 +40,19 @@ var (
 		Message:      "non-ASCII addresses not permitted: SMTPUTF8 not supported",
 	}
 
+	// ErrRecipientNotFQDN: a recipient whose domain is not fully qualified
+	// (`user@gmail`, 2026-10-24). RFC 5321 §2.3.5 says such a name must not
+	// appear in an SMTP transaction, but the go-smtp parser is grammar-only
+	// (§4.1.2 allows a single label), so the session refuses it. Before this
+	// the address was accepted and failed at delivery, where mailqueuer's 422
+	// became a 451 the client retried. 553 5.1.3 is RFC 3463's "bad
+	// destination mailbox address syntax".
+	ErrRecipientNotFQDN = &smtp.SMTPError{
+		Code:         553,
+		EnhancedCode: smtp.EnhancedCode{5, 1, 3},
+		Message:      "recipient domain must be fully qualified domain name",
+	}
+
 	// Authentication errors. Structured SMTPErrors so the auth-failure code is
 	// correct per RFC 4954 §6, which Outlook's setup wizard relies on: a
 	// permanent 535 is a password prompt, a temporary 454 is read as "server

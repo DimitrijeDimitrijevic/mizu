@@ -413,6 +413,18 @@ Key packages:
   "support" and get nothing. Offering the extension needs, together: the
   `Received` protocol token `UTF8SMTP[S][A]` (RFC 6531 §4.3), a marker in the
   delivery POST the backend can act on, and backend EAI support.
+- **A dotless recipient domain is refused at RCPT TO** with `553 5.1.3`
+  (`ErrRecipientNotFQDN`, checked by `hasFQDNDomain` in `Session.Rcpt`
+  before the recipient is recorded). go-smtp's parser is grammar-only —
+  RFC 5321 §4.1.2 allows a single label — but §2.3.5 forbids a non-FQDN in
+  a transaction, and nothing downstream can deliver one: `RCPT TO:<user@gmail>`
+  (2026-10-24) was accepted, then refused by mailqueuer's ingest with a 422
+  that Mizu reported as a 451, so the client retried a permanent typo. The
+  rule (a dot, none leading, trailing or doubled) is mailqueuer's
+  `emailutil.IsValidEmail`, copied rather than imported so the ansible build
+  needs no further sibling checkout. Refused before the recipient-validation
+  API, the spam check and the delivery POST, since none of them see a
+  recipient that is not in `s.to`. MAIL FROM is not checked.
 
 **Received header privacy (`strip_client_identity`):**
 - Per-server `[[server]]` `*bool` that omits the `from <HELO> (<client IP>)`
