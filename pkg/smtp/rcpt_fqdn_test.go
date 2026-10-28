@@ -47,14 +47,20 @@ func TestRcpt_NonFQDNRecipientRefused(t *testing.T) {
 }
 
 func TestRcpt_FQDNRecipientAccepted(t *testing.T) {
-	s := nonASCIISession()
-	s.commandState = stateMail
-	s.from = "sender@example.com"
-	const to = "user@example.com"
-	if err := s.Rcpt(context.Background(), to, nil); err != nil {
-		t.Fatalf("fully qualified recipient refused: %v", err)
-	}
-	if len(s.to) != 1 || s.to[0] != to {
-		t.Fatalf("accepted recipient must be recorded, got %v", s.to)
+	for _, to := range []string{
+		"user@example.com",
+		"user@sub.example.com",
+	} {
+		t.Run(to, func(t *testing.T) {
+			s := nonASCIISession()
+			s.commandState = stateMail
+			s.from = "sender@example.com"
+			if err := s.Rcpt(context.Background(), to, nil); err != nil {
+				t.Fatalf("fully qualified recipient refused: %v", err)
+			}
+			if len(s.to) != 1 || s.to[0] != to {
+				t.Fatalf("accepted recipient must be recorded, got %v", s.to)
+			}
+		})
 	}
 }
