@@ -40,17 +40,27 @@ var (
 		Message:      "non-ASCII addresses not permitted: SMTPUTF8 not supported",
 	}
 
-	// ErrRecipientNotFQDN: a recipient whose domain is not fully qualified
-	// (`user@gmail`, 2026-10-24). RFC 5321 §2.3.5 says such a name must not
-	// appear in an SMTP transaction, but the go-smtp parser is grammar-only
-	// (§4.1.2 allows a single label), so the session refuses it. Before this
-	// the address was accepted and failed at delivery, where mailqueuer's 422
-	// became a 451 the client retried. 553 5.1.3 is RFC 3463's "bad
-	// destination mailbox address syntax".
-	ErrRecipientNotFQDN = &smtp.SMTPError{
+	// ErrInvalidRecipient: a recipient mailqueuer's ingest would refuse
+	// (`user@gmail`, 2026-10-24). The go-smtp parser is grammar-only and
+	// strips the quotes from a quoted local part, so `"a@b"@example.com` and
+	// `"john doe"@example.com` reach the session as unquoted strings. Before
+	// this they were accepted and failed at delivery, where mailqueuer's 422
+	// became a 451 the client retried for days. Returned at RCPT TO
+	// (validRecipient) and, as a backstop, for a 422 at delivery. 553 5.1.3 is
+	// RFC 3463's "bad destination mailbox address syntax".
+	ErrInvalidRecipient = &smtp.SMTPError{
 		Code:         553,
 		EnhancedCode: smtp.EnhancedCode{5, 1, 3},
-		Message:      "recipient domain must be fully qualified domain name",
+		Message:      "invalid recipient address",
+	}
+
+	// ErrRecipientAddressLiteral: a recipient whose domain is an address
+	// literal (`user@[192.0.2.1]`, `user@[IPv6:2001:db8::1]`). A literal never
+	// names a hosted domain, so both families are refused alike.
+	ErrRecipientAddressLiteral = &smtp.SMTPError{
+		Code:         553,
+		EnhancedCode: smtp.EnhancedCode{5, 1, 3},
+		Message:      "address literals not accepted",
 	}
 
 	// Authentication errors. Structured SMTPErrors so the auth-failure code is

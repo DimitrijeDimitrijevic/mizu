@@ -31,6 +31,7 @@ import (
 
 	"github.com/emersion/go-msgauth/authres"
 	"github.com/emersion/go-smtp"
+	"github.com/migadu/emailutil"
 )
 
 // Session timeouts, in the order they bind.
@@ -1421,12 +1422,15 @@ func (s *Session) Rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) e
 		return ErrNonASCIIAddress
 	}
 
-	// A dotless domain cannot be delivered (see ErrRecipientNotFQDN). Refused
-	// here, before the recipient is recorded, so it never reaches the
-	// recipient-validation API, the spam check or the delivery POST.
-	if !hasFQDNDomain(to) {
-		s.Logger.Warn("Rejecting RCPT TO - recipient domain not fully qualified", "to", to)
-		return ErrRecipientNotFQDN
+	// A recipient mailqueuer would refuse after the 250 (see
+	// ErrInvalidRecipient). Refused here, before the recipient is recorded, so
+	// it never reaches the recipient-validation API, the spam check or the
+	// delivery POST. Local mode delivers nowhere, so `me@localhost` is fine.
+	if !s.globalConfig.Local {
+		if err := validRecipient(to); err != nil {
+			s.Logger.Warn("Rejecting RCPT TO - invalid recipient address", "to", to)
+			return err
+		}
 	}
 
 	// Update and check TLS state (skip in local mode)
@@ -2114,11 +2118,21 @@ func (s *Session) deliverToRecipient(ctx context.Context, signedEmail string, re
 				s.distTracker.CacheRecipientBlocked(recipient)
 				return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 7, 1}, Message: "Recipient blocked by destination"}
 			}
+
+			// Ingest's 422 is a verdict on the address, so retrying cannot
+			// succeed. validRecipient refuses these at RCPT TO; this covers any
+			// ingest rule it does not mirror. A backstop only: the reply covers
+			// the whole message, so a 422 for a later recipient bounces a message
+			// the earlier ones already received. Mirror new ingest rules at RCPT.
+			if httpErr.IsInvalidRecipient() {
+				return ErrInvalidRecipient
+			}
 		}
 
 		// Any other delivery failure is treated as temporary so the sender's MTA
 		// retries rather than bouncing the message (zero message loss). Deliberate
-		// backend rejections (404/403/413) are handled above and remain permanent.
+		// backend rejections handled above remain permanent: 413 and 422 always,
+		// 404 and 403 only when a distributed tracker is configured.
 		return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 4, 0}, Message: "Temporary failure, please try again later"}
 	}
 
@@ -2517,22 +2531,19 @@ func isASCII(s string) bool {
 	return true
 }
 
-// hasFQDNDomain reports whether the domain of an envelope address is fully
-// qualified (RFC 5321 §2.3.5): non-empty, holding a dot, with no leading,
-// trailing or doubled dot. The rule is the one mailqueuer's
-// emailutil.IsValidEmail applies at ingest, so an address accepted here is
-// not refused after the 250.
-func hasFQDNDomain(addr string) bool {
-	at := strings.LastIndex(addr, "@")
-	if at < 0 {
-		return false
+// validRecipient refuses a recipient mailqueuer's ingest would refuse after
+// the 250. emailutil.IsValidEmail is the rule ingest applies; on top of it a
+// comma is refused, since ingest splits X-Mail-To on commas (`a,b@example.com`
+// becomes `a` and `b@example.com`), and so is an address literal.
+func validRecipient(addr string) error {
+	// The domain follows the last @ (a quoted local part may hold one), and
+	// is checked for a literal first: an IPv6 literal has no dot, so
+	// IsValidEmail would refuse it with the wrong reply.
+	if at := strings.LastIndex(addr, "@"); at >= 0 && strings.HasPrefix(addr[at+1:], "[") {
+		return ErrRecipientAddressLiteral
 	}
-	domain := addr[at+1:]
-	if domain == "" || !strings.Contains(domain, ".") {
-		return false
+	if strings.Contains(addr, ",") || !emailutil.IsValidEmail(addr) {
+		return ErrInvalidRecipient
 	}
-	if strings.HasPrefix(domain, ".") || strings.HasSuffix(domain, ".") {
-		return false
-	}
-	return !strings.Contains(domain, "..")
+	return nil
 }

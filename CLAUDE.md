@@ -413,18 +413,6 @@ Key packages:
   "support" and get nothing. Offering the extension needs, together: the
   `Received` protocol token `UTF8SMTP[S][A]` (RFC 6531 §4.3), a marker in the
   delivery POST the backend can act on, and backend EAI support.
-- **A dotless recipient domain is refused at RCPT TO** with `553 5.1.3`
-  (`ErrRecipientNotFQDN`, checked by `hasFQDNDomain` in `Session.Rcpt`
-  before the recipient is recorded). go-smtp's parser is grammar-only —
-  RFC 5321 §4.1.2 allows a single label — but §2.3.5 forbids a non-FQDN in
-  a transaction, and nothing downstream can deliver one: `RCPT TO:<user@gmail>`
-  (2026-10-24) was accepted, then refused by mailqueuer's ingest with a 422
-  that Mizu reported as a 451, so the client retried a permanent typo. The
-  rule (a dot, none leading, trailing or doubled) is mailqueuer's
-  `emailutil.IsValidEmail`, copied rather than imported so the ansible build
-  needs no further sibling checkout. Refused before the recipient-validation
-  API, the spam check and the delivery POST, since none of them see a
-  recipient that is not in `s.to`. MAIL FROM is not checked.
 
 **Received header privacy (`strip_client_identity`):**
 - Per-server `[[server]]` `*bool` that omits the `from <HELO> (<client IP>)`
@@ -610,6 +598,31 @@ Key packages:
 - For 450 status code, response body can include JSON `{"message": "custom text", "temporary": true}` to provide custom message for temporary failure
 - Successful validations cached for 5 minutes (configurable)
 - Provides early rejection before DATA phase, reducing bandwidth and processing
+- **An address mailqueuer's ingest would refuse is refused at RCPT TO**, with
+  `553 5.1.3` (`validRecipient` in `Session.Rcpt`, before the recipient is
+  recorded, so it never reaches this API, the spam check or the delivery POST).
+  `RCPT TO:<user@gmail>` (2026-10-24) was accepted, then refused by ingest with
+  a 422 that Mizu reported as a 451, so the client retried a permanent typo for
+  days, and every recipient listed before it was delivered again on each retry.
+  - The rule is `emailutil.IsValidEmail`, imported rather than copied so it
+    cannot drift from ingest: one `@`, no space or control character, a dot in
+    the domain, none leading, trailing or doubled. go-smtp strips the quotes
+    from a quoted local part, so `"a@b"@example.com` and `"john doe"@example.com`
+    reach the session as `a@b@example.com` and `john doe@example.com`.
+  - **A comma is refused on top of it.** Ingest splits `X-Mail-To` on commas
+    and go-smtp copies the domain unchecked, so `user@a.com,b.com` passes
+    `IsValidEmail` and still fails at ingest, and `",bob"@example.com` would be
+    delivered to `bob@example.com`.
+  - **Address literals are refused, both families**
+    (`ErrRecipientAddressLiteral`): a literal never names a hosted domain.
+  - Skipped in `--local` mode, which delivers nowhere (`me@localhost`).
+    MAIL FROM is not checked.
+  - **Backstop: a 422 at delivery is `553 5.1.3`** (`IsInvalidRecipient`,
+    `deliverToRecipient`), not the catch-all 451, so an ingest rule the RCPT
+    check does not mirror cannot start the retry loop again. Not gated on the
+    recipient cache, unlike 404/403. The DATA reply covers the whole message,
+    so a 422 for a later recipient bounces a message the earlier ones already
+    received; the RCPT check is what keeps this path unreachable.
 
 **DNS Checks Configuration:**
 - `[server.dns_checks]` section controls connection-time DNS validation
@@ -868,12 +881,17 @@ deliveryCfg := serverCfg.Delivery
   - `hashicorp/memberlist` - Distributed cluster coordination
   - `aws/aws-sdk-go-v2` - S3 client (certs and stats sync)
   - `prometheus/client_golang` - Metrics
-  - `github.com/migadu/passwd` (local module, `replace github.com/migadu/passwd
-    => ../passwd`) - password hash verification, shared with rcptd/rcptctl and
-    calserver. Building mizu requires the sibling `../passwd` checkout from the
-    ansible-freebsd3 tree; the Ansible build task provides it next to the clone
-    in `.compile/`. (This and `github.com/migadu/emailutil` replaced the former
-    single `shared` module, now split into one module per package.)
+  - `github.com/migadu/passwd` - password hash verification, shared with
+    rcptd/rcptctl and calserver.
+  - `github.com/migadu/emailutil` - `IsValidEmail`, the recipient rule
+    mailqueuer's ingest applies, imported so the RCPT TO check cannot drift
+    from it. **mailqueuer tracks `../emailutil` by `replace`; Mizu pins a
+    commit.** A stricter `IsValidEmail` deployed in mailqueuer before the pin
+    is bumped reopens the 422 → 451 retry loop for whatever it newly rejects,
+    so bump the pin here in the same change.
+  - Both are private repos required by pseudo-version with no `replace`
+    (they replaced the former single `shared` module). Fetching them needs
+    `GOPRIVATE=github.com/migadu` and git credentials for github.com/migadu.
 
 ## Version Information
 
